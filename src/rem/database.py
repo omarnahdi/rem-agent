@@ -56,3 +56,24 @@ def build_session_db(settings: "Settings") -> Any:
 
     db_path: Path = settings.sqlite_db_path()
     return AsyncSqliteDb(db_file=str(db_path))
+
+
+def require_async_session_db(db: Any) -> Any:
+    """Reject synchronous Agno adapters before they can block an async bot.
+
+    ``Agent.arun()`` runs on Discord's asyncio event loop. Passing ``PostgresDb``
+    or ``SqliteDb`` here allows synchronous SQLAlchemy reflection/queries to block
+    that loop (the failure pattern seen in the production heartbeat traceback).
+    Keep the import local so URL/factory unit tests do not require Agno installed.
+    """
+    from agno.db.base import AsyncBaseDb
+
+    if not isinstance(db, AsyncBaseDb):
+        received = f"{type(db).__module__}.{type(db).__qualname__}"
+        raise TypeError(
+            "Rem's Discord agents require an asynchronous Agno session database "
+            "because they call Agent.arun(); received "
+            f"{received}. Configure AsyncPostgresDb or AsyncSqliteDb. "
+            "A synchronous PostgresDb/SqliteDb can block Discord's event loop."
+        )
+    return db

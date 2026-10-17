@@ -11,7 +11,12 @@ from unittest.mock import patch
 # Agno database classes are intentionally imported only by the factory.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from rem.database import POSTGRES_SESSION_SCHEMA, build_session_db, normalize_postgres_url
+from rem.database import (
+    POSTGRES_SESSION_SCHEMA,
+    build_session_db,
+    normalize_postgres_url,
+    require_async_session_db,
+)
 
 
 class NormalizePostgresUrlTests(unittest.TestCase):
@@ -104,6 +109,48 @@ class BuildSessionDbTests(unittest.TestCase):
             Path(result.kwargs["db_file"]),
             Path("data/rem_agno_sessions.db"),
         )
+
+
+class RequireAsyncSessionDbTests(unittest.TestCase):
+    @staticmethod
+    def fake_base_module() -> tuple[dict[str, types.ModuleType], type]:
+        class FakeAsyncBaseDb:
+            pass
+
+        agno = types.ModuleType("agno")
+        agno.__path__ = []
+        agno_db = types.ModuleType("agno.db")
+        agno_db.__path__ = []
+        base_module = types.ModuleType("agno.db.base")
+        base_module.AsyncBaseDb = FakeAsyncBaseDb
+        return (
+            {"agno": agno, "agno.db": agno_db, "agno.db.base": base_module},
+            FakeAsyncBaseDb,
+        )
+
+    def test_accepts_async_agno_adapter(self) -> None:
+        fake_modules, FakeAsyncBaseDb = self.fake_base_module()
+
+        class FakeAsyncPostgresDb(FakeAsyncBaseDb):
+            pass
+
+        db = FakeAsyncPostgresDb()
+        with patch.dict(sys.modules, fake_modules):
+            self.assertIs(require_async_session_db(db), db)
+
+    def test_rejects_sync_agno_adapter_with_actionable_error(self) -> None:
+        fake_modules, _ = self.fake_base_module()
+
+        class FakePostgresDb:
+            pass
+
+        db = FakePostgresDb()
+        with patch.dict(sys.modules, fake_modules):
+            with self.assertRaisesRegex(
+                TypeError,
+                r"require an asynchronous Agno session database.*FakePostgresDb.*AsyncPostgresDb",
+            ):
+                require_async_session_db(db)
 
 
 if __name__ == "__main__":

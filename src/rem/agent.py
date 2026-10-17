@@ -8,7 +8,7 @@ from agno.models.google import Gemini
 from agno.models.groq import Groq
 from agno.tools.websearch import WebSearchTools
 
-from .database import build_session_db
+from .database import build_session_db, require_async_session_db
 from .discord_tools import RemDiscordActionTools, ScopedDiscordTools
 from .curseforge_tools import CurseForgeSearchTools
 from .modrinth_tools import ModrinthSearchTools
@@ -38,8 +38,19 @@ def build_agent(settings: Settings, discord_client=None, *, vision_mode: bool = 
 
     # Share one database object across text and vision agents so session history
     # remains unified and concurrent operations use the same configured backend.
-    db = session_db if session_db is not None else build_session_db(settings)
-    logger.info("Agno history database: %s", "PostgreSQL" if settings.database_url else "local SQLite development fallback")
+    db = require_async_session_db(
+        session_db if session_db is not None else build_session_db(settings)
+    )
+    engine = getattr(db, "db_engine", None)
+    engine_url = getattr(engine, "url", None)
+    driver_name = getattr(engine_url, "drivername", "unknown")
+    logger.info(
+        "Agno session DB adapter=%s.%s | driver=%s | async=true | backend=%s",
+        type(db).__module__,
+        type(db).__qualname__,
+        driver_name,
+        "PostgreSQL" if settings.database_url else "local SQLite development fallback",
+    )
 
     tools = [
         # First-party Agno toolkit, narrowed with runtime scope checks.
