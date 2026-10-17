@@ -1,0 +1,468 @@
+"""Rem built on Agno's official DiscordClient, with a version-pinned extension layer."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import mimetypes
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import discord
+from agno.agent import Agent
+from agno.integrations.discord import DiscordClient
+from agno.media import Image
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+
+# Ensure moderation.py reads GROQ_API_KEY after .env is loaded.
+load_dotenv()
+
+from .agent import build_agent
+from .database import build_session_db
+from .commands import parse_timeout_command, timeout_deadline_matches
+from .context import build_message_context, detect_pending_youtube_confirmation
+from .identity import identify_speaker, session_id_for
+from .routing import should_accept_guild_channel
+from .moderation import moderate_message
+from .memory_service import RemMemoryService
+from .session_locks import SessionLockPool
+from .settings import Settings
+from .text_utils import looks_like_raw_tool_call_payload
+
+logger = logging.getLogger("rem.discord")
+SUPPORTED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"}
+MAX_IMAGES_PER_MESSAGE = 8
+MAX_IMAGE_ATTACHMENT_BYTES = 7 * 1024 * 1024
+MAX_TOTAL_IMAGE_BYTES = 7 * 1024 * 1024
+
+
+class RemAgnoDiscordClient(DiscordClient):
+    """Agno DiscordClient with Rem policies and tested feature hooks.
+
+    This deliberately subclasses Agno's official adapter and uses its response/HITL
+    machinery. `_setup_events` is version-pinned because upstream currently has no
+    public pre-message middleware hook; the copied event flow mirrors Agno 3.1.3,
+    while adding Master-only DMs, legacy moderation, bounded context and multi-image input.
+    """
+
+    def __init__(self, *, agent: Agent, vision_agent: Agent, client: discord.Client, settings: Settings, moderation_client: Any, memory_service: RemMemoryService | None = None) -> None:
+        self.settings = settings
+        self.moderation_client = moderation_client
+        self.vision_agent = vision_agent
+        self.memory_service = memory_service
+        self._session_locks = SessionLockPool()
+        super().__init__(agent=agent, client=client)
+
+    def _setup_events(self) -> None:
+        @self.client.event
+        async def on_message(message: discord.Message) -> None:
+            await self._handle_rem_message(message)
+
+    async def _handle_rem_message(self, message: discord.Message) -> None:
+        bot_user = self.client.user
+        if bot_user is None or message.author.bot or message.author.id == bot_user.id or message.webhook_id is not None:
+            return
+
+        observed_at = datetime.now(timezone.utc).isoformat()
+        source_created_at = message.created_at.astimezone(timezone.utc).isoformat()
+        is_master = int(message.author.id) == self.settings.master_discord_id
+
+        # Policy gate happens before moderation, context collection or Agent execution.
+        # Non-Master DMs never enter the model, tools or session database.
+        if message.guild is None and not is_master:
+            logger.info("Ignored non-Master DM | author_id=%s | message_id=%s", message.author.id, message.id)
+            return
+
+        # Beta rollout is channel-scoped by default. For threads, the parent text
+        # channel can be allowlisted so replies inside a beta thread continue to work.
+        if message.guild is not None:
+            current_channel_id = int(getattr(message.channel, "id", 0) or 0)
+            parent_channel_id = getattr(message.channel, "parent_id", None)
+            if not should_accept_guild_channel(
+                channel_id=current_channel_id,
+                parent_channel_id=int(parent_channel_id) if parent_channel_id is not None else None,
+                allowed_channel_ids=self.settings.allowed_guild_channel_ids,
+                allow_all_channels=self.settings.allow_all_guild_channels,
+            ):
+                logger.debug(
+                    "Ignored guild message outside configured beta channels | guild_id=%s | channel_id=%s | parent_channel_id=%s",
+                    message.guild.id,
+                    current_channel_id,
+                    parent_channel_id,
+                )
+                return
+
+        # The old AI moderation runs on ordinary server messages, not only messages that address Rem.
+        if message.guild is not None and not is_master:
+            try:
+                handled = await moderate_message(
+                    gemini=self.moderation_client,
+                    message=message,
+                    master_id=self.settings.master_discord_id,
+                    bot_user_id=bot_user.id,
+                )
+                if handled:
+                    logger.info(
+                        "Message stopped by moderation policy (action taken or fail-closed) | message_id=%s",
+                        message.id,
+                    )
+                    return
+            except Exception:
+                # Moderation is mandatory. Unexpected errors fail closed: do not
+                # send an unchecked guest message to the conversational agent.
+                logger.exception(
+                    "Moderation pipeline failed | message_id=%s; skipping agent run and taking no automatic punishment",
+                    message.id,
+                )
+                return
+
+        is_reply_to_rem, referenced_message = await self._resolve_reply(message)
+        # Timeout actions stay explicit: the user must address Rem by mention or reply, and must be Master.
+        if is_master and message.guild is not None and (bot_user in message.mentions or is_reply_to_rem):
+            parsed_timeout = parse_timeout_command(
+                message,
+                author_id=message.author.id,
+                bot_id=bot_user.id,
+                referenced_message=referenced_message,
+            )
+            if parsed_timeout:
+                await self._apply_explicit_timeout(message, parsed_timeout)
+                return
+
+        message_text = (message.content or "").strip()
+        image_inputs, ignored_media = await self._collect_images(message)
+        if not message_text and image_inputs:
+            message_text = "Please inspect the attached image(s) and help me understand what they show."
+        elif not message_text and ignored_media:
+            message_text = "The user sent attachment(s) that aren't supported by visual input yet. Explain briefly that you couldn't inspect those attachment(s), and ask for supported still images or a text description."
+        elif not message_text:
+            message_text = "The user sent an empty Discord message. Respond briefly and naturally if appropriate."
+        if ignored_media and message.content.strip():
+            message_text += "\n\n[Application note: one or more attachments were not passed to visual analysis. Do not claim to have seen those attachments.]"
+
+        original_channel = message.channel
+        message_channel_id = getattr(original_channel, "id", None)
+        # For a message inside a thread, retain both the thread and its parent
+        # text channel so history/search tools can see the relevant conversation.
+        if isinstance(original_channel, discord.Thread):
+            source_channel_id = getattr(original_channel, "parent_id", None) or message_channel_id
+        else:
+            source_channel_id = message_channel_id
+        thread: Any
+        if isinstance(original_channel, discord.Thread):
+            thread = original_channel
+        elif isinstance(original_channel, discord.DMChannel):
+            thread = original_channel
+        elif isinstance(original_channel, discord.TextChannel):
+            try:
+                thread = await message.create_thread(name=f"{message.author.display_name}'s thread"[:100])
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception("Agno thread creation failed; replying in source channel | message_id=%s", message.id)
+                thread = original_channel
+        else:
+            logger.info("Ignored unsupported Discord channel type=%s id=%s", type(original_channel).__name__, getattr(original_channel, "id", None))
+            return
+
+        conversation_channel_id = getattr(thread, "id", None)
+        actual_thread_id = thread.id if isinstance(thread, discord.Thread) else None
+        guild_id = message.guild.id if message.guild else None
+        identity = identify_speaker(
+            discord_user_id=message.author.id,
+            display_name=message.author.display_name,
+            username=message.author.name,
+            master_discord_id=self.settings.master_discord_id,
+        )
+        context = await build_message_context(message)
+        pending_youtube_confirmation = detect_pending_youtube_confirmation(message_text, context)
+
+        # Long-term memory is independent from Agno's session history. The curator
+        # runs in a tracked background task so it cannot delay this Discord reply.
+        # Memory errors are non-fatal: the ordinary conversation still proceeds.
+        memory_context = ""
+        if self.memory_service is not None and message.content.strip():
+            try:
+                memory_context = await self.memory_service.prepare_message(
+                    message_id=message.id,
+                    user_id=message.author.id,
+                    guild_id=message.guild.id if message.guild else None,
+                    channel_id=message_channel_id or source_channel_id or 0,
+                    display_name=message.author.display_name,
+                    content=message.content,
+                    source_created_at=message.created_at.astimezone(timezone.utc),
+                    channel_context=context,
+                )
+            except Exception:
+                logger.exception(
+                    "Long-term memory preparation failed; continuing without memory context | message_id=%s",
+                    message.id,
+                )
+
+        # A separate metadata dictionary is injected into RunContext for tools; trusted
+        # dependencies are added to model context. The Agent itself is never mutated per run.
+        dependencies = {
+            "trusted_discord_user_id": str(identity.discord_user_id),
+            "trusted_discord_display_name": identity.display_name,
+            "trusted_discord_username": identity.username,
+            "trusted_discord_role": identity.role,
+            "trusted_discord_is_master": "true" if identity.is_master else "false",
+            "trusted_current_message": message_text,
+            "trusted_youtube_confirmation_pending": pending_youtube_confirmation,
+            "discord_context": context,
+            "discord_message_id": str(message.id),
+            "discord_message_url": message.jump_url,
+            "discord_source_channel_id": str(source_channel_id) if source_channel_id is not None else "",
+            "discord_message_channel_id": str(message_channel_id) if message_channel_id is not None else "",
+            "discord_thread_id": str(actual_thread_id) if actual_thread_id is not None else "",
+            "discord_guild_id": str(guild_id) if guild_id is not None else "",
+            "discord_current_channel_id": str(conversation_channel_id or message_channel_id or source_channel_id or ""),
+            "discord_source_created_at": source_created_at,
+            "discord_observed_at": observed_at,
+            "discord_mentioned_rem": bot_user in message.mentions,
+            "discord_is_reply_to_rem": is_reply_to_rem,
+            "discord_mentions": [
+                {"id": str(member.id), "display_name": member.display_name, "username": member.name}
+                for member in message.mentions if not member.bot
+            ],
+        }
+        if memory_context:
+            dependencies["rem_long_term_memory_context"] = memory_context
+        run_metadata = {
+            "trusted_discord_user_id": str(identity.discord_user_id),
+            "trusted_discord_is_master": identity.is_master,
+            "discord_source_channel_id": str(source_channel_id) if source_channel_id is not None else "",
+            "discord_message_channel_id": str(message_channel_id) if message_channel_id is not None else "",
+            "discord_thread_id": str(actual_thread_id) if actual_thread_id is not None else "",
+            "discord_current_channel_id": str(conversation_channel_id or message_channel_id or source_channel_id or ""),
+            "discord_guild_id": str(guild_id) if guild_id is not None else "",
+            "discord_message_id": str(message.id),
+        }
+        # Agno databases associate a session with one user ID. A Discord thread
+        # is shared by multiple humans, so reusing the bare thread ID with each
+        # author's distinct Agno user_id can cause ownership conflicts. Keep each
+        # person's durable Agent session isolated and build shared context from
+        # Discord history instead.
+        session_channel_id = conversation_channel_id or source_channel_id or message.author.id
+        session_id = session_id_for(
+            guild_id=guild_id,
+            channel_id=int(session_channel_id),
+            user_id=identity.discord_user_id,
+        )
+
+        logger.info(
+            "Accepted message | message_id=%s | author_id=%s | role=%s | guild_id=%s | source_channel=%s | conversation_channel=%s | thread_id=%s | images=%d | source_created_at=%s | observed_at=%s",
+            message.id, identity.discord_user_id, identity.role, guild_id, source_channel_id, conversation_channel_id, actual_thread_id, len(image_inputs), source_created_at, observed_at,
+        )
+
+        async with self._session_locks.hold(session_id):
+            try:
+                async with thread.typing():
+                    # Keep the legacy provider policy: text requests may fall back to
+                    # GPT-OSS 120B, while requests containing images use the separate
+                    # vision-capable Qwen fallback. Never send image payloads to a text-only model.
+                    run_agent = self.vision_agent if image_inputs else self.agent
+                    agent_response = await run_agent.arun(
+                        input=message_text,
+                        user_id=str(identity.discord_user_id),
+                        session_id=session_id,
+                        dependencies=dependencies,
+                        add_dependencies_to_context=True,
+                        metadata=run_metadata,
+                        add_history_to_context=True,
+                        images=image_inputs or None,
+                    )
+                # Do not expose provider/framework error details to Discord. Agno's
+                # adapter response pipeline still handles successful tool runs, HITL
+                # and long-message splitting.
+                if str(getattr(agent_response, "status", "")).upper() == "ERROR":
+                    logger.error(
+                        "Agno returned an error status | message_id=%s | content_type=%s",
+                        message.id,
+                        type(getattr(agent_response, "content", None)).__name__,
+                    )
+                    await self._send_discord_messages(
+                        thread,
+                        "I'm sorry, Master—something went wrong while I was processing that. I couldn't verify a result, so I won't pretend it worked. Please try again shortly. 🌸" if identity.is_master else "I'm sorry, something went wrong while I was processing that. I couldn't verify a result, so I won't pretend it worked. Please try again shortly. 🌸",
+                    )
+                    return
+
+                # Use Agno's response/HITL/long-message handling. This is where real
+                # registered tools complete before a final natural-language response.
+                await self._handle_response_in_thread(agent_response, thread)
+                logger.info("Agent response delivered | message_id=%s | role=%s", message.id, identity.role)
+            except Exception:
+                logger.exception("Agno Discord message processing failed | message_id=%s", message.id)
+                try:
+                    await thread.send(
+                        "I'm sorry, I couldn't complete that properly just now. Please try again in a moment.",
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except discord.HTTPException:
+                    logger.exception("Could not send processing error message | message_id=%s", message.id)
+
+    async def _send_discord_messages(self, thread: Any, message: str, italics: bool = False) -> None:
+        """Keep Agno response handling while blocking raw function-call JSON from chat."""
+        content = message or ""
+        if not content.strip():
+            logger.warning("Agno returned an empty user-facing response")
+            content = "I couldn't form a proper reply this time. Please try again in a moment. 🌸"
+        if looks_like_raw_tool_call_payload(content):
+            logger.error("Blocked raw tool-call payload from Discord output; tool execution/result flow was not represented as a user-facing answer.")
+            content = "I couldn't complete that request properly, so I can't give you verified results yet. Please try again in a moment. 🌸"
+            italics = False
+        chunks = [content[i:i + 1500] for i in range(0, len(content), 1500)] if len(content) >= 1500 else [content]
+        for index, chunk in enumerate(chunks, 1):
+            if len(chunks) > 1:
+                chunk = f"[{index}/{len(chunks)}] {chunk}"
+            if italics:
+                chunk = "\n".join(f"_{line}_" for line in chunk.split("\n"))
+            await thread.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+
+    async def _collect_images(self, message: discord.Message) -> tuple[list[Image], bool]:
+        image_inputs: list[Image] = []
+        ignored_media = False
+        total_image_bytes = 0
+        for attachment in message.attachments:
+            mime = (attachment.content_type or mimetypes.guess_type(attachment.filename)[0] or "").casefold()
+            if mime == "image/gif" or (attachment.filename or "").casefold().endswith(".gif"):
+                # GIF input is explicitly deferred to a later phase; video input is not required.
+                ignored_media = True
+                continue
+            if mime.startswith("video/"):
+                # Video input is deliberately not part of this migration.
+                ignored_media = True
+                continue
+            if mime not in SUPPORTED_IMAGE_MIMES:
+                ignored_media = True
+                continue
+            if len(image_inputs) >= MAX_IMAGES_PER_MESSAGE:
+                logger.warning("Image attachment limit reached | message_id=%s", message.id)
+                ignored_media = True
+                break
+            if attachment.size and attachment.size > MAX_IMAGE_ATTACHMENT_BYTES:
+                logger.warning("Skipping oversized image %s (%d bytes)", attachment.filename, attachment.size)
+                ignored_media = True
+                continue
+            if attachment.size and total_image_bytes + attachment.size > MAX_TOTAL_IMAGE_BYTES:
+                logger.warning("Image payload budget reached; skipping %s", attachment.filename)
+                ignored_media = True
+                continue
+            image_inputs.append(Image(url=attachment.url))
+            total_image_bytes += int(attachment.size or 0)
+        return image_inputs, ignored_media
+
+    async def _resolve_reply(self, message: discord.Message) -> tuple[bool, Any | None]:
+        reference = message.reference
+        if reference is None or reference.message_id is None:
+            return False, None
+        referenced: Any = reference.resolved
+        if not isinstance(referenced, discord.Message):
+            try:
+                referenced = await message.channel.fetch_message(reference.message_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return False, None
+        return bool(self.client.user and referenced.author.id == self.client.user.id), referenced
+
+    async def _apply_explicit_timeout(self, message: discord.Message, request: dict[str, Any]) -> None:
+        guild = message.guild
+        if guild is None:
+            return
+        target_id = int(request["user_id"])
+        bot_user = self.client.user
+        if bot_user and target_id == bot_user.id:
+            await message.reply("I can't timeout myself, Master. 🥺", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+            return
+        try:
+            member = guild.get_member(target_id) or await guild.fetch_member(target_id)
+            me = guild.me
+            if me is None or not me.guild_permissions.moderate_members:
+                await message.reply("Master, I don't have the Timeout Members permission. 🥺", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+                return
+            if member.bot:
+                await message.reply("I won't timeout another bot, Master. 🥺", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+                return
+            if member.top_role >= me.top_role:
+                await message.reply("I can't timeout that member because their highest role is equal to or higher than mine, Master. 🥺", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+                return
+            seconds = int(request["seconds"])
+            if seconds <= 0 or seconds > 28 * 24 * 3600:
+                await message.reply("Please give me a timeout duration between 1 second and 28 days, Master. 🥺", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+                return
+            # Write the requested deadline once (no remove-then-apply gap), then
+            # re-fetch authoritative state and verify the requested deadline.
+            expected_until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+            await member.timeout(timedelta(seconds=seconds), reason="Manual timeout requested by Master via Rem")
+            verified_member = await guild.fetch_member(target_id)
+            until = getattr(verified_member, "communication_disabled_until", None)
+            if not timeout_deadline_matches(expected_until, until):
+                await message.reply("Discord didn't confirm the requested timeout deadline, Master, so I won't claim it succeeded. 🥺", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+                logger.error("Timeout deadline mismatch | target_id=%s | expected=%s | actual=%s", target_id, expected_until.isoformat(), until.isoformat() if until else None)
+                return
+            logger.info("TIMEOUT SUCCESS | target_id=%s | seconds=%s | until=%s", target_id, seconds, until.isoformat())
+            await message.reply(f"Right away, Master. 🌸 {member.display_name} has been timed out for {request['amount']} {request['unit']}.", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+        except discord.Forbidden:
+            logger.exception("Discord forbade timeout | target_id=%s", target_id)
+            await message.reply("Discord refused the timeout, Master. Please check my permissions and role hierarchy. 🥺", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            logger.exception("Discord timeout API error | target_id=%s", target_id)
+            await message.reply("The timeout request failed in Discord, Master. I haven't marked it as successful. 🥺", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+
+
+def create_discord_client(settings: Settings) -> RemAgnoDiscordClient:
+    intents = discord.Intents.default()
+    intents.message_content = True
+    intents.members = True
+    client = discord.Client(intents=intents)
+    # Both Agent instances share the same session DB and ID so they use one
+    # history store, while preserving distinct text-only and vision fallbacks.
+    session_db = build_session_db(settings)
+    memory_service = RemMemoryService(settings)
+    agent = build_agent(
+        settings, discord_client=client, session_db=session_db, vision_mode=False,
+        memory_service=memory_service,
+    )
+    vision_agent = build_agent(
+        settings, discord_client=client, session_db=session_db, vision_mode=True,
+        memory_service=memory_service,
+    )
+    moderation_client = genai.Client(
+        api_key=settings.gemini_api_key,
+        http_options=types.HttpOptions(timeout=180000),
+    )
+    if not memory_service.enabled:
+        logger.warning(
+            "Long-term memory is disabled: set REM_MEMORY_DATABASE_URL (or NEON_DATABASE_URL) and GEMINI_API_KEY in .env"
+        )
+    return RemAgnoDiscordClient(
+        agent=agent, vision_agent=vision_agent, client=client, settings=settings,
+        moderation_client=moderation_client, memory_service=memory_service,
+    )
+
+
+def run_bot() -> None:
+    """Run through Agno DiscordClient.serve(), keeping the official entry point."""
+    load_dotenv()
+    settings = Settings.from_env(load_env_file=False)
+    settings.validate_runtime()
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    # Agno 3.1.3's serve() reads this standard name. Preserve compatibility with
+    # the legacy DISCORD_TOKEN setting accepted by Settings.
+    if settings.discord_token:
+        os.environ["DISCORD_BOT_TOKEN"] = settings.discord_token
+    integration = create_discord_client(settings)
+    integration.serve()
+
+
+def main() -> None:
+    try:
+        run_bot()
+    except KeyboardInterrupt:
+        logger.info("Rem stopped by keyboard interrupt.")
+
+
+if __name__ == "__main__":
+    main()
