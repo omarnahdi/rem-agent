@@ -10,7 +10,7 @@ dependencies = [
   "google-genai>=1.0.0",
   "groq>=0.30.0",
   "python-dotenv>=1.0.1",
-  "sqlalchemy>=2.0.0",
+  "sqlalchemy[asyncio]>=2.0.0",
   "asyncpg>=0.31.0",
   "mem0ai[nlp]==2.2.1",
   "psycopg[binary]>=3.2.0",
