@@ -30,7 +30,7 @@ from .moderation import moderate_message
 from .memory_service import RemMemoryService
 from .session_locks import SessionLockPool
 from .settings import Settings
-from .text_utils import looks_like_raw_tool_call_payload
+from .text_utils import looks_like_raw_tool_call_payload, normalize_modrinth_markdown_links
 
 logger = logging.getLogger("rem.discord")
 SUPPORTED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"}
@@ -365,6 +365,19 @@ class RemAgnoDiscordClient(DiscordClient):
                         "I'm sorry, Master—something went wrong while I was processing that. I couldn't verify a result, so I won't pretend it worked. Please try again shortly. 🌸" if identity.is_master else "I'm sorry, something went wrong while I was processing that. I couldn't verify a result, so I won't pretend it worked. Please try again shortly. 🌸",
                     )
                     return
+
+                # Repair the occasional malformed Modrinth Markdown URL before Agno
+                # renders/sends the final response. Keep the framework's normal
+                # response, HITL, and long-message handling otherwise unchanged.
+                response_content = getattr(agent_response, "content", None)
+                if isinstance(response_content, str):
+                    normalized_content = normalize_modrinth_markdown_links(response_content)
+                    if normalized_content != response_content:
+                        logger.warning(
+                            "Repaired malformed Modrinth Markdown link(s) | message_id=%s",
+                            message.id,
+                        )
+                        agent_response.content = normalized_content
 
                 # Use Agno's response/HITL/long-message handling. This is where real
                 # registered tools complete before a final natural-language response.
