@@ -491,7 +491,9 @@ class RemMemoryService:
                 result = await asyncio.to_thread(
                     self.mem0.search,
                     query=query[:2000],
-                    user_id=mem0_user_id,
+                    # Mem0 OSS 2.2.1 requires user scoping through filters=
+                    # rather than the removed top-level user_id search argument.
+                    filters={"user_id": mem0_user_id},
                     limit=max(1, min(8, limit * 2)),
                 )
         except Exception:

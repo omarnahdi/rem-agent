@@ -161,6 +161,35 @@ class MemoryServiceHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["message_id"] for item in call["batch_candidates"]], ["100", "101"])
         self.assertEqual(call["channel_context"], "richer topic context")
 
+
+    async def test_mem0_search_uses_filters_for_user_scope(self):
+        class FakeMem0:
+            def __init__(self):
+                self.kwargs = None
+
+            def search(self, **kwargs):
+                self.kwargs = kwargs
+                return {"results": []}
+
+        service = RemMemoryService(SimpleNamespace())
+        service.pool = object()
+        service.mem0 = FakeMem0()
+
+        result = await service._search_scope(
+            query="preferred Minecraft mod loader",
+            scope_type="user",
+            scope_id="992390617575477268",
+            limit=5,
+        )
+
+        self.assertEqual(result, [])
+        self.assertEqual(
+            service.mem0.kwargs["filters"],
+            {"user_id": "rem-beta:user:992390617575477268"},
+        )
+        self.assertNotIn("user_id", service.mem0.kwargs)
+        self.assertEqual(service.mem0.kwargs["limit"], 8)
+
     async def test_direct_reply_can_still_retrieve_mem0_memories(self):
         settings = SimpleNamespace(
             memory_database_url="postgresql://example",
