@@ -162,6 +162,27 @@ class MemoryServiceHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call["channel_context"], "richer topic context")
 
 
+    def test_entity_store_is_warmed_once_during_initialization(self):
+        class FakeEntityStore:
+            def __init__(self):
+                self.calls = 0
+
+            def col_info(self):
+                self.calls += 1
+                return {"table_name": "rem_agno_beta_memory_index_entities"}
+
+        class FakeMem0:
+            def __init__(self):
+                self.entity_store = FakeEntityStore()
+
+        mem0 = FakeMem0()
+        RemMemoryService._warm_mem0_entity_store(mem0)
+        self.assertEqual(mem0.entity_store.calls, 1)
+
+    def test_entity_store_warmup_fails_loudly_if_store_missing(self):
+        with self.assertRaisesRegex(RuntimeError, "entity_store"):
+            RemMemoryService._warm_mem0_entity_store(object())
+
     async def test_mem0_search_uses_filters_for_user_scope(self):
         class FakeMem0:
             def __init__(self):

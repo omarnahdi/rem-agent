@@ -144,6 +144,12 @@ class RemMemoryService:
                     await conn.execute(schema_path.read_text(encoding="utf-8"))
 
                 self.mem0 = await asyncio.to_thread(self._build_mem0)
+                # Mem0 2.2.1 lazily initializes its pgvector entity collection on
+                # first search, while its entity-boost search runs multiple entity
+                # queries concurrently. Warm the collection once, serially, before
+                # Discord starts accepting messages to avoid concurrent CREATE TABLE
+                # attempts racing on PostgreSQL's implicit row type.
+                await asyncio.to_thread(self._warm_mem0_entity_store, self.mem0)
                 self.curator, self._decision_model, self._proposal_model = self._build_curator()
                 self._initialized = True
                 await self._expire_old_records()
@@ -216,6 +222,24 @@ class RemMemoryService:
             ),
         }
         return Memory.from_config(config)
+
+    @staticmethod
+    def _warm_mem0_entity_store(mem0: Any) -> None:
+        """Initialize Mem0's pgvector entity collection before concurrent searches.
+
+        Mem0 2.2.1 performs entity-boost searches concurrently. The pgvector
+        store's lazy collection-creation flag is not synchronized, so the first
+        search can make multiple workers attempt CREATE TABLE simultaneously.
+        Calling col_info once during startup makes the collection check/create
+        complete before message handling begins. Errors intentionally propagate
+        to initialize(), which reports the memory subsystem unavailable instead
+        of pretending the entity collection initialized correctly.
+        """
+        entity_store = getattr(mem0, "entity_store", None)
+        if entity_store is None:
+            raise RuntimeError("Mem0 client does not expose the expected entity_store")
+        entity_store.col_info()
+        logger.info("Mem0 entity collection initialized before message handling")
 
     def _build_curator(self) -> tuple[Any, Any, Any]:
         """Create an Agno agent with a validated Pydantic output schema."""
