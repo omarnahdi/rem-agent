@@ -35,17 +35,37 @@ _SENSITIVE_FACT_CUES = re.compile(
     r"sexual orientation is|my religion is|my political party is)\b"
 )
 _URL_ONLY_OR_COMMAND = re.compile(r"^(?:https?://\S+|/[^\s]+|!\S+)\s*$", re.IGNORECASE)
+_MARKDOWN_LINK_ONLY = re.compile(r"^(?:\[[^\]\n]+\]\(https?://[^)\s]+\)\s*)+$", re.IGNORECASE)
 
 
 def count_words(text: str) -> int:
     return len(re.findall(r"\b[\w'’\-]+\b", text or "", flags=re.UNICODE))
 
 
+def should_count_for_memory_review(text: str, *, min_words: int = 7) -> bool:
+    """Whether this event counts toward the periodic memory-review threshold.
+
+    Messages remain eligible as short-lived evidence even when this returns
+    False. Explicit preference/project/correction cues count regardless of
+    length; otherwise a non-noise event must have at least ``min_words`` words.
+    This lets a short latest message close a batch once enough meaningful
+    messages have accumulated, without short acknowledgements inflating the
+    periodic counter on their own.
+    """
+    content = (text or "").strip()
+    if not content or _URL_ONLY_OR_COMMAND.fullmatch(content) or _MARKDOWN_LINK_ONLY.fullmatch(content):
+        return False
+    if _SECRET_OR_SENSITIVE_CUES.search(content) or _SENSITIVE_FACT_CUES.search(content):
+        return False
+    if _EXPLICIT_VALUE_CUES.search(content):
+        return True
+    return count_words(content) >= max(1, int(min_words))
+
+
 def should_consider_for_memory(
     text: str,
     *,
     message_count_24h: int,
-    min_words: int = 7,
     review_every: int = 10,
     messages_since_review: int | None = None,
 ) -> bool:
@@ -63,9 +83,9 @@ def should_consider_for_memory(
     to the old modulo threshold until migrated. This function never stores a fact.
     """
     content = (text or "").strip()
-    if not content or _URL_ONLY_OR_COMMAND.fullmatch(content):
+    if not content or _URL_ONLY_OR_COMMAND.fullmatch(content) or _MARKDOWN_LINK_ONLY.fullmatch(content):
         return False
-    if _SECRET_OR_SENSITIVE_CUES.search(content):
+    if _SECRET_OR_SENSITIVE_CUES.search(content) or _SENSITIVE_FACT_CUES.search(content):
         return False
     if _EXPLICIT_VALUE_CUES.search(content):
         return True
@@ -87,7 +107,7 @@ def should_record_raw_event(text: str) -> bool:
     policy deliberately blocks high-risk content before it reaches PostgreSQL.
     """
     content = (text or "").strip()
-    if not content or _URL_ONLY_OR_COMMAND.fullmatch(content):
+    if not content or _URL_ONLY_OR_COMMAND.fullmatch(content) or _MARKDOWN_LINK_ONLY.fullmatch(content):
         return False
     if _SECRET_OR_SENSITIVE_CUES.search(content):
         return False

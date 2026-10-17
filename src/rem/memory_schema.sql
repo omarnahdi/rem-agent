@@ -11,8 +11,18 @@ CREATE TABLE IF NOT EXISTS rem_beta_raw_events (
     author_display_name TEXT NOT NULL,
     content TEXT NOT NULL,
     source_created_at TIMESTAMPTZ NOT NULL,
+    review_eligible BOOLEAN NOT NULL DEFAULT TRUE,
     recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Backward-compatible upgrade for an existing beta database. Existing historical
+-- events are kept as curator evidence but do not count toward the new word threshold.
+-- New application inserts explicitly set review_eligible; default TRUE preserves
+-- compatibility for any maintenance/import code that omits the column.
+ALTER TABLE rem_beta_raw_events ADD COLUMN IF NOT EXISTS review_eligible BOOLEAN;
+UPDATE rem_beta_raw_events SET review_eligible = FALSE WHERE review_eligible IS NULL;
+ALTER TABLE rem_beta_raw_events ALTER COLUMN review_eligible SET DEFAULT TRUE;
+ALTER TABLE rem_beta_raw_events ALTER COLUMN review_eligible SET NOT NULL;
 
 CREATE TABLE IF NOT EXISTS rem_beta_memory_records (
     id BIGSERIAL PRIMARY KEY,

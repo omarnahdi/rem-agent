@@ -93,6 +93,40 @@ class MemoryServiceHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "")
         service._search_scope.assert_not_awaited()
 
+    async def test_min_words_is_passed_to_periodic_review_eligibility(self):
+        settings = SimpleNamespace(
+            memory_database_url="postgresql://example",
+            memory_collection=DEFAULT_MEM0_COLLECTION,
+            gemini_api_key="test-key",
+            memory_min_words=7,
+            memory_review_every=10,
+            memory_batch_window_seconds=2,
+            memory_event_retention_days=30,
+        )
+        service = RemMemoryService(settings)
+        service._initialized = True
+        service.pool = object()
+        service.mem0 = object()
+        service._last_cleanup_monotonic = time.monotonic()
+        service.initialize = AsyncMock(return_value=True)
+        service._record_event = AsyncMock(return_value=(1, 1, True))
+        service._search_scope = AsyncMock(return_value=[])
+
+        with patch("rem.memory_service.should_record_raw_event", return_value=True), \
+             patch("rem.memory_service.should_consider_for_memory", return_value=False):
+            await service.prepare_message(
+                message_id=557,
+                user_id=123,
+                guild_id=789,
+                channel_id=456,
+                display_name="TestUser",
+                content="yeah okay",
+                source_created_at=datetime.now(timezone.utc),
+                retrieve_memories=False,
+            )
+
+        self.assertFalse(service._record_event.await_args.kwargs["review_eligible"])
+
     async def test_curation_candidates_are_coalesced_into_one_batch(self):
         settings = SimpleNamespace(
             memory_database_url="postgresql://example",

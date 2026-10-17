@@ -22,6 +22,7 @@ from .memory_policy import (
     normalize_fact,
     render_memory_context,
     should_consider_for_memory,
+    should_count_for_memory_review,
     should_record_raw_event,
     validate_candidate,
 )
@@ -282,6 +283,8 @@ class RemMemoryService:
         messages_since_review = 0
         inserted = False
         if should_record_raw_event(content):
+            min_words = int(getattr(self.settings, "memory_min_words", 7))
+            review_countable = should_count_for_memory_review(content, min_words=min_words)
             event_id, messages_since_review, inserted = await self._record_event(
                 message_id=message_id,
                 user_id=user_id,
@@ -290,6 +293,7 @@ class RemMemoryService:
                 display_name=display_name,
                 content=content[:4000],
                 source_created_at=source_created_at,
+                review_eligible=review_countable,
             )
 
         qualifies_for_curation = bool(
@@ -299,7 +303,6 @@ class RemMemoryService:
                 content,
                 message_count_24h=messages_since_review,
                 messages_since_review=messages_since_review,
-                min_words=int(getattr(self.settings, "memory_min_words", 7)),
                 review_every=int(getattr(self.settings, "memory_review_every", 10)),
             )
         )
@@ -418,8 +421,9 @@ class RemMemoryService:
         display_name: str,
         content: str,
         source_created_at: datetime,
+        review_eligible: bool = True,
     ) -> tuple[int, int, bool]:
-        """Persist one eligible event and count events since the last review watermark."""
+        """Persist evidence and count only messages eligible for periodic review."""
         assert self.pool is not None
         guild_key = str(guild_id) if guild_id is not None else "dm"
         async with self.pool.acquire() as conn:
@@ -427,13 +431,13 @@ class RemMemoryService:
                 """
                 INSERT INTO rem_beta_raw_events (
                     discord_message_id, discord_user_id, guild_id, channel_id,
-                    author_display_name, content, source_created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    author_display_name, content, source_created_at, review_eligible
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 ON CONFLICT (discord_message_id) DO NOTHING
                 RETURNING id
                 """,
                 str(message_id), str(user_id), str(guild_id) if guild_id is not None else None,
-                str(channel_id), display_name[:128], content, source_created_at,
+                str(channel_id), display_name[:128], content, source_created_at, bool(review_eligible),
             )
             inserted = row is not None
             if row is None:
@@ -456,6 +460,7 @@ class RemMemoryService:
                 WHERE discord_user_id = $1
                   AND guild_id IS NOT DISTINCT FROM $2
                   AND id > $3
+                  AND review_eligible IS TRUE
                 """,
                 str(user_id), str(guild_id) if guild_id is not None else None, int(last_reviewed or 0),
             )

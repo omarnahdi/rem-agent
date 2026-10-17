@@ -6,6 +6,7 @@ from rem.memory_policy import (
     normalize_fact,
     render_memory_context,
     should_consider_for_memory,
+    should_count_for_memory_review,
     should_record_raw_event,
     validate_candidate,
 )
@@ -15,7 +16,7 @@ class MemoryPolicyTests(unittest.TestCase):
     def test_explicit_preference_triggers_even_when_short(self):
         self.assertTrue(
             should_consider_for_memory(
-                "I prefer Fabric", message_count_24h=1, min_words=7, review_every=5
+                "I prefer Fabric", message_count_24h=1, review_every=5
             )
         )
 
@@ -28,7 +29,7 @@ class MemoryPolicyTests(unittest.TestCase):
         # The batch curator will inspect previous author/channel messages; the
         # latest message itself need not contain the fact or meet min_words.
         self.assertTrue(should_consider_for_memory(
-            "yeah", message_count_24h=12, messages_since_review=10, review_every=10, min_words=7
+            "yeah", message_count_24h=12, messages_since_review=10, review_every=10
         ))
 
     def test_indirect_preference_is_caught_by_periodic_batch_not_only_explicit_cues(self):
@@ -48,26 +49,28 @@ class MemoryPolicyTests(unittest.TestCase):
             )
         )
 
-def test_periodic_review_allows_pattern_detection(self):
-    text = "PvP is fun, but building and farming dominate my weekends"
-
-    self.assertFalse(
-        should_consider_for_memory(
-            text,
-            message_count_24h=4,
-            review_every=5,
-            messages_since_review=4,
+    def test_periodic_review_allows_pattern_detection(self):
+        text = "PvP is fun, but building and farming dominate my weekends"
+        self.assertFalse(
+            should_consider_for_memory(
+                text, message_count_24h=4, review_every=5, messages_since_review=4
+            )
         )
-    )
-
-    self.assertTrue(
-        should_consider_for_memory(
-            text,
-            message_count_24h=5,
-            review_every=5,
-            messages_since_review=5,
+        self.assertTrue(
+            should_consider_for_memory(
+                text, message_count_24h=5, review_every=5, messages_since_review=5
+            )
         )
-    )
+
+    def test_min_words_controls_periodic_review_counting(self):
+        self.assertFalse(should_count_for_memory_review("yeah okay", min_words=7))
+        self.assertTrue(should_count_for_memory_review("The server was busy yesterday", min_words=5))
+        # Explicit useful signals count even when short.
+        self.assertTrue(should_count_for_memory_review("I prefer Fabric", min_words=7))
+        self.assertFalse(should_count_for_memory_review("/status", min_words=1))
+
+    def test_markdown_link_only_is_not_raw_memory_evidence(self):
+        self.assertFalse(should_record_raw_event("[https://example.com](https://example.com)"))
 
     def test_commands_and_empty_messages_do_not_trigger(self):
         self.assertFalse(should_consider_for_memory("/status", message_count_24h=5))
