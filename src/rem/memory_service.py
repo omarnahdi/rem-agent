@@ -240,6 +240,8 @@ class RemMemoryService:
             markdown=False,
             add_history_to_context=False,
             add_datetime_to_context=True,
+            debug_mode=bool(getattr(self.settings, "agno_debug_mode", True)),
+            debug_level=int(getattr(self.settings, "agno_debug_level", 1)),
         )
         return agent, MemoryCurationDecision, MemoryProposal
 

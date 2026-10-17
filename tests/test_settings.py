@@ -34,5 +34,47 @@ class AllowedChannelSettingsTests(unittest.TestCase):
             self.load_settings("123,not-a-channel")
 
 
+class AgnoDebugSettingsTests(unittest.TestCase):
+    def load_settings(self, **values) -> Settings:
+        env = {
+            "AGNO_DEBUG_MODE": "true",
+            "AGNO_DEBUG_LEVEL": "1",
+            **values,
+        }
+        with patch.dict(os.environ, env, clear=True):
+            return Settings.from_env(load_env_file=False)
+
+    def test_agno_debug_enabled_by_default_for_beta(self):
+        with patch.dict(os.environ, {}, clear=True):
+            settings = Settings.from_env(load_env_file=False)
+        self.assertTrue(settings.agno_debug_mode)
+        self.assertEqual(settings.agno_debug_level, 1)
+
+    def test_agno_debug_can_be_disabled(self):
+        settings = self.load_settings(AGNO_DEBUG_MODE="false")
+        self.assertFalse(settings.agno_debug_mode)
+
+    def test_agno_debug_level_two_is_supported(self):
+        settings = self.load_settings(AGNO_DEBUG_LEVEL="2")
+        self.assertEqual(settings.agno_debug_level, 2)
+
+    def test_invalid_agno_debug_level_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "AGNO_DEBUG_LEVEL"):
+            self.load_settings(AGNO_DEBUG_LEVEL="3")
+
+    def test_invalid_agno_debug_mode_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "AGNO_DEBUG_MODE"):
+            self.load_settings(AGNO_DEBUG_MODE="sometimes")
+
+    def test_curseforge_api_key_is_optional_and_loaded_when_set(self):
+        with patch.dict(os.environ, {}, clear=True):
+            missing = Settings.from_env(load_env_file=False)
+        self.assertIsNone(missing.curseforge_api_key)
+
+        with patch.dict(os.environ, {"CURSEFORGE_API_KEY": "test-key"}, clear=True):
+            configured = Settings.from_env(load_env_file=False)
+        self.assertEqual(configured.curseforge_api_key, "test-key")
+
+
 if __name__ == "__main__":
     unittest.main()

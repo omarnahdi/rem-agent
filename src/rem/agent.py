@@ -10,6 +10,7 @@ from agno.tools.websearch import WebSearchTools
 
 from .database import build_session_db
 from .discord_tools import RemDiscordActionTools, ScopedDiscordTools
+from .curseforge_tools import CurseForgeSearchTools
 from .modrinth_tools import ModrinthSearchTools
 from .memory_tools import RemMemoryTools
 from .memory_service import RemMemoryService
@@ -50,6 +51,8 @@ def build_agent(settings: Settings, discord_client=None, *, vision_mode: bool = 
         YouTubeSearchTools(timeout=12),
         # Current Modrinth catalog search for mod suggestions.
         ModrinthSearchTools(timeout=12),
+        # Official CurseForge Minecraft mod catalogue; requires an optional API key.
+        CurseForgeSearchTools(api_key=settings.curseforge_api_key, timeout=12),
     ]
     if memory_service is not None:
         # Long-term memory reads and explicit mutations all pass through scoped
@@ -68,6 +71,8 @@ def build_agent(settings: Settings, discord_client=None, *, vision_mode: bool = 
         num_history_runs=settings.history_runs,
         add_datetime_to_context=True,
         markdown=True,
+        debug_mode=settings.agno_debug_mode,
+        debug_level=settings.agno_debug_level,
         tool_call_limit=8,
         # We intentionally do not mutate Agent.additional_context per message.
     )

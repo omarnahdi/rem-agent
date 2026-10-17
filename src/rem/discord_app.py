@@ -445,9 +445,22 @@ def run_bot() -> None:
     load_dotenv()
     settings = Settings.from_env(load_env_file=False)
     settings.validate_runtime()
+    configured_log_level = getattr(logging, settings.log_level, logging.INFO)
     logging.basicConfig(
-        level=getattr(logging, settings.log_level, logging.INFO),
+        level=configured_log_level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    # Agno's Agent(debug_mode=True) emits detailed diagnostics through its own
+    # logger hierarchy. Keep ordinary application logs at LOG_LEVEL while
+    # allowing Agno DEBUG records when explicitly enabled for beta diagnosis.
+    logging.getLogger("agno").setLevel(
+        logging.DEBUG if settings.agno_debug_mode else configured_log_level
+    )
+    logger.info(
+        "Logging configured | root_level=%s | agno_debug_mode=%s | agno_debug_level=%s",
+        logging.getLevelName(configured_log_level),
+        settings.agno_debug_mode,
+        settings.agno_debug_level,
     )
     # Agno 3.1.3's serve() reads this standard name. Preserve compatibility with
     # the legacy DISCORD_TOKEN setting accepted by Settings.

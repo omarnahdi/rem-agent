@@ -17,6 +17,7 @@ class Settings:
     master_discord_id: int
     gemini_api_key: str | None
     gemini_model: str
+    curseforge_api_key: str | None
     groq_api_key: str | None
     groq_rem_model: str
     groq_vision_model: str
@@ -24,6 +25,8 @@ class Settings:
     sqlite_session_db: str
     history_runs: int
     log_level: str
+    agno_debug_mode: bool
+    agno_debug_level: int
     memory_database_url: str | None
     memory_collection: str
     memory_min_words: int
@@ -63,6 +66,12 @@ class Settings:
                 raise ValueError(f"{name} must be between {minimum} and {maximum}.")
             return value
 
+        debug_mode_raw = os.getenv("AGNO_DEBUG_MODE", "true").strip().casefold()
+        if debug_mode_raw not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+            raise ValueError("AGNO_DEBUG_MODE must be true/false, yes/no, on/off, or 1/0.")
+        agno_debug_mode = debug_mode_raw in {"1", "true", "yes", "on"}
+        agno_debug_level = positive_int("AGNO_DEBUG_LEVEL", "1", 1, 2)
+
         raw_channel_ids = os.getenv("REM_ALLOWED_CHANNEL_IDS", "").strip()
         allow_all_guild_channels = raw_channel_ids.casefold() == "all"
         parsed_channel_ids: set[int] = set()
@@ -87,6 +96,7 @@ class Settings:
             master_discord_id=master_id,
             gemini_api_key=(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip() or None,
             gemini_model=os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip(),
+            curseforge_api_key=os.getenv("CURSEFORGE_API_KEY", "").strip() or None,
             groq_api_key=os.getenv("GROQ_API_KEY", "").strip() or None,
             groq_rem_model=os.getenv("GROQ_REM_MODEL", DEFAULT_GROQ_REM_MODEL).strip(),
             groq_vision_model=os.getenv("GROQ_VISION_MODEL", DEFAULT_GROQ_VISION_MODEL).strip(),
@@ -94,6 +104,8 @@ class Settings:
             sqlite_session_db=os.getenv("SQLITE_SESSION_DB", "data/rem_agno_sessions.db").strip(),
             history_runs=history_runs,
             log_level=os.getenv("LOG_LEVEL", "INFO").upper().strip(),
+            agno_debug_mode=agno_debug_mode,
+            agno_debug_level=agno_debug_level,
             # Memory has its own namespace and Mem0 collection. Falling back to the
             # existing Neon URL is safe for this code because beta table/collection
             # names are unique, so the existing Neon branch may be reused.

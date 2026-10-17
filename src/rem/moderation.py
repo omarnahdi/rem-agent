@@ -5,6 +5,7 @@
 import asyncio
 import os
 import json
+import logging
 import re
 from typing import Optional
 from datetime import timedelta
@@ -14,6 +15,8 @@ from dotenv import load_dotenv
 
 from .commands import timeout_deadline_matches
 from .moderation_policy import must_block_conversation_agent
+
+logger = logging.getLogger(__name__)
 
 # Load the same .env before reading GROQ_API_KEY, independent of import order.
 load_dotenv()
@@ -102,7 +105,7 @@ MASTER_FAST_ABUSE_PATTERNS = (
     r"(?:master|omar|omar\s+nahdi|umar|umar\s+nahdi|nalla|nallaa|berojgaar|berojgar|nightx|nightxwolf|nightx\s+wolf)\b",
 )
 
-print(f"[MODERATION MODULE] Loaded from: {__file__}")
+logger.debug(f"[MODERATION MODULE] Loaded from: {__file__}")
 
 
 # ============================================================
@@ -291,14 +294,14 @@ async def build_moderation_context(
         discord.Forbidden,
         discord.HTTPException,
     ) as e:
-        print(
+        logger.error(
             f"[MODERATION CONTEXT] History fetch failed: {type(e).__name__}: {e}"
         )
         return []
 
     messages.reverse()
 
-    print(
+    logger.debug(
         f"[MODERATION CONTEXT] Loaded {len(messages)} "
         f"recent message(s) for message {message.id}."
     )
@@ -409,7 +412,7 @@ async def _direct_target_member(
         return candidates[0]
 
     if len(candidates) > 1:
-        print(
+        logger.debug(
             "[MODERATION TARGET TEXT] Ambiguous current-message target -> "
             + ", ".join(member.display_name for member in candidates[:8])
         )
@@ -452,7 +455,7 @@ async def get_target_member(
         )
 
         if contextual_target is not None:
-            print(
+            logger.debug(
                 "[MODERATION TARGET CONTEXT] "
                 f"Inherited from message {previous.id} -> "
                 f"{_member_identity(contextual_target)}"
@@ -496,7 +499,7 @@ async def infer_contextual_target_after_abuse(
             continue
 
         if author.id == master_id:
-            print(
+            logger.debug(
                 "[MODERATION TARGET CONTEXT] "
                 "ABUSE message follows Master's message -> "
                 f"{_member_identity(author)}"
@@ -507,7 +510,7 @@ async def infer_contextual_target_after_abuse(
         # from the guild cache to keep the target identity stable.
         member = message.guild.get_member(author.id)
         if member is not None and not member.bot:
-            print(
+            logger.debug(
                 "[MODERATION TARGET CONTEXT] "
                 "ABUSE message follows another human's message -> "
                 f"{_member_identity(member)}"
@@ -637,7 +640,7 @@ async def _groq_moderation_fallback(
     """
 
     if groq is None:
-        print(
+        logger.error(
             "[MODERATION GROQ] "
             "Fallback unavailable. "
             "Set GROQ_API_KEY and install the groq package."
@@ -658,7 +661,7 @@ FALLBACK EXECUTION RULES:
 """
 
     try:
-        print(
+        logger.warning(
             f"[MODERATION GROQ] "
             f"Gemini unavailable. Trying {GROQ_MODERATION_MODEL}..."
         )
@@ -694,7 +697,7 @@ FALLBACK EXECUTION RULES:
         if result["classification"] == "UNAVAILABLE":
             raise ValueError("Groq returned an invalid moderation classification.")
 
-        print(
+        logger.info(
             "[MODERATION GROQ] "
             f"{GROQ_MODERATION_MODEL} responded successfully."
         )
@@ -702,7 +705,7 @@ FALLBACK EXECUTION RULES:
         return result
 
     except Exception as e:
-        print(
+        logger.error(
             "[MODERATION GROQ] "
             f"Fallback error: {e}"
         )
@@ -835,14 +838,14 @@ Do not include additional fields.
         return result
 
     except Exception as e:
-        print(
+        logger.error(
             f"[MODERATION AI] Gemini classifier error: {type(e).__name__}: {e}"
         )
 
         try:
             return await _groq_moderation_fallback(prompt)
         except Exception as fallback_error:
-            print(
+            logger.error(
                 "[MODERATION AI] "
                 f"All classifier paths failed: {type(fallback_error).__name__}: "
                 f"{fallback_error}"
@@ -895,14 +898,14 @@ async def moderate_message(
 
     author = message.author
 
-    print(
+    logger.info(
         "[MODERATION CHECK] "
         f"Author={author.display_name} | "
         f"Username=@{author.name} | "
         f"Mention={author.mention} | "
         f"UserID={author.id} | "
         f"MessageID={message.id} | "
-        f"Content={message.content!r}"
+        f"ContentLength={len(message.content or '')}"
     )
 
     # --------------------------------------------------------
@@ -912,7 +915,7 @@ async def moderate_message(
     recent_messages = await build_moderation_context(message)
     moderation_context = format_moderation_context(recent_messages)
 
-    print(
+    logger.debug(
         f"[MODERATION CONTEXT] chars={len(moderation_context)} | "
         f"messages={len(recent_messages)}"
     )
@@ -930,20 +933,20 @@ async def moderate_message(
 
     if target is not None:
         if target.bot:
-            print(
+            logger.debug(
                 "[MODERATION TARGET] Bot target detected -> no punitive target action."
             )
         elif target.id == author.id:
-            print(
+            logger.debug(
                 "[MODERATION TARGET] Self-directed message -> no punitive target action."
             )
         else:
-            print(
+            logger.debug(
                 "[MODERATION TARGET] "
                 f"{_member_identity(target)}"
             )
     else:
-        print(
+        logger.debug(
             "[MODERATION TARGET] Unresolved; message will STILL be classified."
         )
 
@@ -967,7 +970,7 @@ async def moderate_message(
 
     if fast_result is not None:
         result = fast_result
-        print(
+        logger.info(
             "[MODERATION FAST] "
             f"Classification={result['classification']} | "
             f"Confidence={result['confidence']:.2f} | "
@@ -995,7 +998,7 @@ async def moderate_message(
         # fail closed: the caller must not pass an unmoderated message to Rem's
         # conversational agent. Returning True means the message was handled
         # by this policy gate, not that a punitive action was taken.
-        print(
+        logger.warning(
             "[MODERATION RESULT] UNAVAILABLE -> fail closed; no punishment or "
             "counter update, and the message will not enter the conversation agent."
         )
@@ -1015,7 +1018,7 @@ async def moderate_message(
 
         if contextual_target is not None and contextual_target.id != author.id:
             action_target = contextual_target
-            print(
+            logger.debug(
                 "[MODERATION TARGET CONTEXT] "
                 "Resolved target after ABUSE classification: "
                 f"{_member_identity(action_target)}"
@@ -1027,7 +1030,7 @@ async def moderate_message(
         else "UNRESOLVED"
     )
 
-    print(
+    logger.info(
         "[MODERATION AI] "
         f"Author={author.display_name} | "
         f"AuthorID={author.id} | "
@@ -1042,7 +1045,7 @@ async def moderate_message(
     # --------------------------------------------------------
 
     if classification == "SAFE":
-        print("[MODERATION RESULT] SAFE -> no action.")
+        logger.info("[MODERATION RESULT] SAFE -> no action.")
         return False
 
     # --------------------------------------------------------
@@ -1050,7 +1053,7 @@ async def moderate_message(
     # --------------------------------------------------------
 
     if classification == "MILD_INSULT":
-        print("[MODERATION RESULT] MILD_INSULT -> no punitive action.")
+        logger.info("[MODERATION RESULT] MILD_INSULT -> no punitive action.")
         return False
 
     # --------------------------------------------------------
@@ -1058,7 +1061,7 @@ async def moderate_message(
     # --------------------------------------------------------
 
     if classification != "ABUSE":
-        print(
+        logger.warning(
             f"[MODERATION RESULT] Unknown classification={classification!r} -> no action."
         )
         return False
@@ -1068,7 +1071,7 @@ async def moderate_message(
     # --------------------------------------------------------
 
     if confidence < 0.70:
-        print(
+        logger.warning(
             "[MODERATION RESULT] ABUSE confidence below 0.70 -> no action."
         )
         return False
@@ -1082,11 +1085,11 @@ async def moderate_message(
         me = message.guild.me
 
         if me is None:
-            print("[AUTO-TIMEOUT] Guild member cache returned no bot member.")
+            logger.warning("[AUTO-TIMEOUT] Guild member cache returned no bot member.")
             return False
 
         if not me.guild_permissions.moderate_members:
-            print(
+            logger.warning(
                 "[AUTO-TIMEOUT] Rem lacks Timeout Members permission."
             )
 
@@ -1096,7 +1099,7 @@ async def moderate_message(
             return True
 
         if member.top_role >= me.top_role:
-            print(
+            logger.warning(
                 "[AUTO-TIMEOUT] Target role is too high."
             )
 
@@ -1114,7 +1117,7 @@ async def moderate_message(
             verified_member = await message.guild.fetch_member(member.id)
             until = getattr(verified_member, "communication_disabled_until", None)
             if not timeout_deadline_matches(expected_until, until):
-                print(
+                logger.error(
                     "[AUTO-TIMEOUT UNVERIFIED] Discord did not confirm the "
                     f"requested deadline for member_id={member.id}; expected="
                     f"{expected_until.isoformat()} actual="
@@ -1126,7 +1129,7 @@ async def moderate_message(
                 )
                 return True
 
-            print(
+            logger.info(
                 "[AUTO-TIMEOUT SUCCESS] "
                 f"TargetAuthor={_member_identity(member)} | "
                 "Duration=1 minute | "
@@ -1143,7 +1146,7 @@ async def moderate_message(
             return True
 
         except discord.Forbidden:
-            print(
+            logger.error(
                 "[AUTO-TIMEOUT ERROR] Discord permission denied."
             )
 
@@ -1153,13 +1156,13 @@ async def moderate_message(
             return True
 
         except discord.HTTPException as e:
-            print(
+            logger.error(
                 f"[AUTO-TIMEOUT ERROR] Discord HTTP error: {type(e).__name__}: {e}"
             )
             return False
 
         except Exception as e:
-            print(
+            logger.error(
                 f"[AUTO-TIMEOUT ERROR] Unexpected error: {type(e).__name__}: {e}"
             )
             return False
@@ -1176,7 +1179,7 @@ async def moderate_message(
         offender_id,
     )
 
-    print(
+    logger.info(
         "[MODERATION COUNT] "
         f"Author={author.display_name} | "
         f"AuthorID={author.id} | "
@@ -1203,7 +1206,7 @@ async def moderate_message(
 
         await message.reply(response)
 
-        print(
+        logger.warning(
             "[MODERATION WARNING] "
             f"Author={author.display_name} | Count=1"
         )
@@ -1218,11 +1221,11 @@ async def moderate_message(
     me = message.guild.me
 
     if me is None:
-        print("[AUTO-TIMEOUT ERROR] Guild member cache returned no bot member.")
+        logger.error("[AUTO-TIMEOUT ERROR] Guild member cache returned no bot member.")
         return False
 
     if not me.guild_permissions.moderate_members:
-        print(
+        logger.warning(
             "[AUTO-TIMEOUT] Rem lacks Timeout Members permission."
         )
 
@@ -1232,7 +1235,7 @@ async def moderate_message(
         return True
 
     if member.top_role >= me.top_role:
-        print(
+        logger.warning(
             "[AUTO-TIMEOUT] Offender role is too high."
         )
 
@@ -1250,7 +1253,7 @@ async def moderate_message(
         verified_member = await message.guild.fetch_member(member.id)
         until = getattr(verified_member, "communication_disabled_until", None)
         if not timeout_deadline_matches(expected_until, until):
-            print(
+            logger.error(
                 "[AUTO-TIMEOUT UNVERIFIED] Discord did not confirm the "
                 f"requested deadline for member_id={member.id}; expected="
                 f"{expected_until.isoformat()} actual="
@@ -1262,7 +1265,7 @@ async def moderate_message(
             )
             return True
 
-        print(
+        logger.info(
             "[AUTO-TIMEOUT SUCCESS] "
             f"TargetAuthor={_member_identity(member)} | "
             f"Duration=1 minute | "
@@ -1292,7 +1295,7 @@ async def moderate_message(
         return True
 
     except discord.Forbidden:
-        print(
+        logger.error(
             "[AUTO-TIMEOUT ERROR] Discord permission denied."
         )
 
@@ -1302,13 +1305,13 @@ async def moderate_message(
         return True
 
     except discord.HTTPException as e:
-        print(
+        logger.error(
             f"[AUTO-TIMEOUT ERROR] Discord HTTP error: {type(e).__name__}: {e}"
         )
         return False
 
     except Exception as e:
-        print(
+        logger.error(
             f"[AUTO-TIMEOUT ERROR] Unexpected error: {type(e).__name__}: {e}"
         )
         return False
