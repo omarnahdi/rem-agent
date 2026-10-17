@@ -34,6 +34,11 @@ class Settings:
     memory_event_retention_days: int
     allowed_guild_channel_ids: frozenset[int]
     allow_all_guild_channels: bool
+    engagement_enabled: bool
+    groq_engagement_model: str
+    engagement_batch_window_ms: int
+    engagement_min_eval_interval_seconds: int
+    memory_batch_window_seconds: int
 
     @classmethod
     def from_env(cls, *, load_env_file: bool = True) -> "Settings":
@@ -71,6 +76,11 @@ class Settings:
             raise ValueError("AGNO_DEBUG_MODE must be true/false, yes/no, on/off, or 1/0.")
         agno_debug_mode = debug_mode_raw in {"1", "true", "yes", "on"}
         agno_debug_level = positive_int("AGNO_DEBUG_LEVEL", "1", 1, 2)
+
+        engagement_enabled_raw = os.getenv("REM_ENGAGEMENT_ENABLED", "true").strip().casefold()
+        if engagement_enabled_raw not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+            raise ValueError("REM_ENGAGEMENT_ENABLED must be true/false, yes/no, on/off, or 1/0.")
+        engagement_enabled = engagement_enabled_raw in {"1", "true", "yes", "on"}
 
         raw_channel_ids = os.getenv("REM_ALLOWED_CHANNEL_IDS", "").strip()
         allow_all_guild_channels = raw_channel_ids.casefold() == "all"
@@ -112,10 +122,15 @@ class Settings:
             memory_database_url=(os.getenv("REM_MEMORY_DATABASE_URL") or os.getenv("NEON_DATABASE_URL") or "").strip() or None,
             memory_collection=(os.getenv("REM_MEMORY_COLLECTION") or "rem_agno_beta_memory_index").strip(),
             memory_min_words=positive_int("REM_MEMORY_MIN_WORDS", "7", 1, 50),
-            memory_review_every=positive_int("REM_MEMORY_REVIEW_EVERY", "5", 1, 100),
+            memory_review_every=positive_int("REM_MEMORY_REVIEW_EVERY", "10", 1, 100),
+            memory_batch_window_seconds=positive_int("REM_MEMORY_BATCH_WINDOW_SECONDS", "8", 2, 60),
             memory_event_retention_days=positive_int("REM_MEMORY_EVENT_RETENTION_DAYS", "30", 1, 365),
             allowed_guild_channel_ids=frozenset(parsed_channel_ids),
             allow_all_guild_channels=allow_all_guild_channels,
+            engagement_enabled=engagement_enabled,
+            groq_engagement_model=os.getenv("GROQ_ENGAGEMENT_MODEL", "openai/gpt-oss-20b").strip(),
+            engagement_batch_window_ms=positive_int("REM_ENGAGEMENT_BATCH_WINDOW_MS", "1500", 250, 5000),
+            engagement_min_eval_interval_seconds=positive_int("REM_ENGAGEMENT_MIN_EVAL_INTERVAL_SECONDS", "2", 0, 120),
         )
 
     def validate_runtime(self) -> None:
@@ -129,6 +144,8 @@ class Settings:
             raise RuntimeError("GROQ_REM_MODEL must not be empty.")
         if not self.groq_vision_model:
             raise RuntimeError("GROQ_VISION_MODEL must not be empty.")
+        if not self.groq_engagement_model:
+            raise RuntimeError("GROQ_ENGAGEMENT_MODEL must not be empty.")
 
     def sqlite_db_path(self) -> Path:
         path = Path(self.sqlite_session_db).expanduser()

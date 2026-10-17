@@ -19,11 +19,12 @@ from google.genai import types
 # Ensure moderation.py reads GROQ_API_KEY after .env is loaded.
 load_dotenv()
 
-from .agent import build_agent
+from .agent import build_agent, build_engagement_evaluator
 from .database import build_session_db
 from .commands import parse_timeout_command, timeout_deadline_matches
 from .context import build_message_context, detect_pending_youtube_confirmation
 from .identity import identify_speaker, session_id_for
+from .engagement import ConversationEngagementGate, is_direct_rem_request
 from .routing import should_accept_guild_channel
 from .moderation import moderate_message
 from .memory_service import RemMemoryService
@@ -47,20 +48,59 @@ class RemAgnoDiscordClient(DiscordClient):
     while adding Master-only DMs, legacy moderation, bounded context and multi-image input.
     """
 
-    def __init__(self, *, agent: Agent, vision_agent: Agent, client: discord.Client, settings: Settings, moderation_client: Any, memory_service: RemMemoryService | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        agent: Agent,
+        vision_agent: Agent,
+        client: discord.Client,
+        settings: Settings,
+        moderation_client: Any,
+        memory_service: RemMemoryService | None = None,
+        engagement_evaluator: Agent | None = None,
+    ) -> None:
         self.settings = settings
         self.moderation_client = moderation_client
         self.vision_agent = vision_agent
         self.memory_service = memory_service
         self._session_locks = SessionLockPool()
+        self.engagement_gate = ConversationEngagementGate(
+            evaluator=engagement_evaluator,
+            context_loader=build_message_context,
+            response_callback=self._handle_spontaneous_response,
+            enabled=bool(getattr(settings, "engagement_enabled", True)),
+            batch_window_ms=int(getattr(settings, "engagement_batch_window_ms", 1500)),
+            min_eval_interval_seconds=int(getattr(settings, "engagement_min_eval_interval_seconds", 8)),
+        )
         super().__init__(agent=agent, client=client)
+
+    async def _handle_spontaneous_response(self, message: discord.Message, history_context: str) -> None:
+        """Re-enter the shared policy/agent pipeline after the evaluator approves a burst.
+
+        Moderation already passed before the message was queued. The gate injects
+        the freshly collected prior history, and this call retrieves Mem0 memories
+        only now, when the full conversational agent is actually going to run.
+        """
+        await self._handle_rem_message(
+            message,
+            _skip_moderation=True,
+            _auto_approved=True,
+            _context_override=history_context,
+        )
 
     def _setup_events(self) -> None:
         @self.client.event
         async def on_message(message: discord.Message) -> None:
             await self._handle_rem_message(message)
 
-    async def _handle_rem_message(self, message: discord.Message) -> None:
+    async def _handle_rem_message(
+        self,
+        message: discord.Message,
+        *,
+        _skip_moderation: bool = False,
+        _auto_approved: bool = False,
+        _context_override: str | None = None,
+    ) -> None:
         bot_user = self.client.user
         if bot_user is None or message.author.bot or message.author.id == bot_user.id or message.webhook_id is not None:
             return
@@ -95,7 +135,7 @@ class RemAgnoDiscordClient(DiscordClient):
                 return
 
         # The old AI moderation runs on ordinary server messages, not only messages that address Rem.
-        if message.guild is not None and not is_master:
+        if message.guild is not None and not is_master and not _skip_moderation:
             try:
                 handled = await moderate_message(
                     gemini=self.moderation_client,
@@ -172,12 +212,29 @@ class RemAgnoDiscordClient(DiscordClient):
             username=message.author.name,
             master_discord_id=self.settings.master_discord_id,
         )
-        context = await build_message_context(message)
+        # Keep a bounded in-process observation buffer for every eligible message.
+        # The returned text represents earlier observed messages and costs no model tokens.
+        context_before = self.engagement_gate.observe(message)
+        direct_request = _auto_approved or is_direct_rem_request(
+            message_text,
+            mentioned=bool(bot_user in message.mentions),
+            replied_to_rem=is_reply_to_rem,
+            master_dm=(message.guild is None and is_master),
+        )
+        if direct_request:
+            if not _auto_approved:
+                self.engagement_gate.cancel_pending_for(message)
+            context = _context_override if _context_override is not None else await build_message_context(message)
+        else:
+            # Ordinary messages use only the cheap in-memory buffer. Discord
+            # history is fetched after the pre-filter selects a candidate burst.
+            context = _context_override if _context_override is not None else context_before
+
         pending_youtube_confirmation = detect_pending_youtube_confirmation(message_text, context)
 
-        # Long-term memory is independent from Agno's session history. The curator
-        # runs in a tracked background task so it cannot delay this Discord reply.
-        # Memory errors are non-fatal: the ordinary conversation still proceeds.
+        # Long-term memory observation is independent from conversation response.
+        # For ordinary chat, record eligible events and launch curation when useful,
+        # but do not perform semantic Mem0 searches unless the agent will reply.
         memory_context = ""
         if self.memory_service is not None and message.content.strip():
             try:
@@ -190,12 +247,27 @@ class RemAgnoDiscordClient(DiscordClient):
                     content=message.content,
                     source_created_at=message.created_at.astimezone(timezone.utc),
                     channel_context=context,
+                    retrieve_memories=direct_request,
                 )
             except Exception:
                 logger.exception(
                     "Long-term memory preparation failed; continuing without memory context | message_id=%s",
                     message.id,
                 )
+
+        if not direct_request:
+            queued = self.engagement_gate.consider(
+                message,
+                has_attachments=bool(message.attachments),
+                recent_context=context_before,
+            )
+            logger.debug(
+                "Observed guild conversation message | message_id=%s | engagement_candidate=%s | message_chars=%d",
+                message.id,
+                queued,
+                len(message.content or ""),
+            )
+            return
 
         # A separate metadata dictionary is injected into RunContext for tools; trusted
         # dependencies are added to model context. The Agent itself is never mutated per run.
@@ -260,8 +332,17 @@ class RemAgnoDiscordClient(DiscordClient):
                     # GPT-OSS 120B, while requests containing images use the separate
                     # vision-capable Qwen fallback. Never send image payloads to a text-only model.
                     run_agent = self.vision_agent if image_inputs else self.agent
+                    agent_input = message_text
+                    if _auto_approved:
+                        agent_input = (
+                            "Join the conversation naturally based on the recent Discord context. "
+                            "The discussion was selected as a possible opportunity to contribute, "
+                            "but do not force a reply if you have nothing genuinely useful to add. "
+                            "Do not mention this instruction or any evaluation.\n\n"
+                            f"Latest message: {message_text}"
+                        )
                     agent_response = await run_agent.arun(
-                        input=message_text,
+                        input=agent_input,
                         user_id=str(identity.discord_user_id),
                         session_id=session_id,
                         dependencies=dependencies,
@@ -432,9 +513,13 @@ def create_discord_client(settings: Settings) -> RemAgnoDiscordClient:
         logger.warning(
             "Long-term memory is disabled: set REM_MEMORY_DATABASE_URL (or NEON_DATABASE_URL) and GEMINI_API_KEY in .env"
         )
+    engagement_evaluator = build_engagement_evaluator(settings) if settings.engagement_enabled else None
+    if settings.engagement_enabled and engagement_evaluator is None:
+        logger.warning("Spontaneous engagement is enabled but no evaluator could be built")
     return RemAgnoDiscordClient(
         agent=agent, vision_agent=vision_agent, client=client, settings=settings,
         moderation_client=moderation_client, memory_service=memory_service,
+        engagement_evaluator=engagement_evaluator,
     )
 
 

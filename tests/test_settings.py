@@ -76,5 +76,27 @@ class AgnoDebugSettingsTests(unittest.TestCase):
         self.assertEqual(configured.curseforge_api_key, "test-key")
 
 
+    def test_engagement_is_enabled_by_default_with_low_cost_defaults(self):
+        with patch.dict(os.environ, {}, clear=True):
+            settings = Settings.from_env(load_env_file=False)
+        self.assertTrue(settings.engagement_enabled)
+        self.assertEqual(settings.groq_engagement_model, "openai/gpt-oss-20b")
+        self.assertEqual(settings.engagement_batch_window_ms, 1500)
+        self.assertEqual(settings.engagement_min_eval_interval_seconds, 2)
+        self.assertEqual(settings.memory_review_every, 10)
+        self.assertEqual(settings.memory_batch_window_seconds, 8)
+
+    def test_engagement_can_be_disabled(self):
+        with patch.dict(os.environ, {"REM_ENGAGEMENT_ENABLED": "false"}, clear=True):
+            settings = Settings.from_env(load_env_file=False)
+        self.assertFalse(settings.engagement_enabled)
+
+    def test_invalid_engagement_setting_is_rejected(self):
+        with patch.dict(os.environ, {"REM_ENGAGEMENT_ENABLED": "sometimes"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "REM_ENGAGEMENT_ENABLED"):
+                Settings.from_env(load_env_file=False)
+
+
+
 if __name__ == "__main__":
     unittest.main()

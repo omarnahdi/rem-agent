@@ -19,7 +19,28 @@ class MemoryPolicyTests(unittest.TestCase):
             )
         )
 
-    def test_long_message_triggers_curator(self):
+    def test_generic_message_waits_for_periodic_batch_review(self):
+        text = "The server was busy yesterday and everyone played together for hours"
+        self.assertFalse(should_consider_for_memory(text, message_count_24h=2, messages_since_review=2))
+        self.assertTrue(should_consider_for_memory(text, message_count_24h=10, messages_since_review=10))
+
+    def test_short_current_message_can_trigger_review_of_prior_indirect_context(self):
+        # The batch curator will inspect previous author/channel messages; the
+        # latest message itself need not contain the fact or meet min_words.
+        self.assertTrue(should_consider_for_memory(
+            "yeah", message_count_24h=12, messages_since_review=10, review_every=10, min_words=7
+        ))
+
+    def test_indirect_preference_is_caught_by_periodic_batch_not_only_explicit_cues(self):
+        self.assertTrue(should_consider_for_memory(
+            "I keep coming back to Fabric because it feels easier",
+            message_count_24h=10, messages_since_review=10, review_every=10
+        ))
+        self.assertFalse(should_consider_for_memory(
+            "This is an ordinary comment", message_count_24h=3, messages_since_review=3, review_every=10
+        ))
+
+    def test_explicit_project_statement_triggers_immediately(self):
         self.assertTrue(
             should_consider_for_memory(
                 "I am working on a Minecraft castle and want to finish it this weekend",
@@ -27,12 +48,26 @@ class MemoryPolicyTests(unittest.TestCase):
             )
         )
 
-    def test_periodic_review_allows_pattern_detection(self):
-        self.assertTrue(
-            should_consider_for_memory(
-                "PvP is fun", message_count_24h=10, min_words=7, review_every=5
-            )
+def test_periodic_review_allows_pattern_detection(self):
+    text = "PvP is fun, but building and farming dominate my weekends"
+
+    self.assertFalse(
+        should_consider_for_memory(
+            text,
+            message_count_24h=4,
+            review_every=5,
+            messages_since_review=4,
         )
+    )
+
+    self.assertTrue(
+        should_consider_for_memory(
+            text,
+            message_count_24h=5,
+            review_every=5,
+            messages_since_review=5,
+        )
+    )
 
     def test_commands_and_empty_messages_do_not_trigger(self):
         self.assertFalse(should_consider_for_memory("/status", message_count_24h=5))

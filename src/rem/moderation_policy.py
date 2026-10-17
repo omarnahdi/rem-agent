@@ -1,11 +1,24 @@
-"""Pure moderation policy helpers shared by runtime code and tests."""
+"""Small, pure fail-closed gate for Rem's moderation pipeline.
+
+Classification, abuse detection, target resolution, warnings, and timeouts live
+in ``moderation.py``. This module only decides whether a message is allowed to
+continue into Rem's conversational agent after the moderation stage.
+"""
+
+from __future__ import annotations
+
+VALID_MODERATION_CLASSIFICATIONS = frozenset({"SAFE", "MILD_INSULT", "ABUSE"})
 
 
 def must_block_conversation_agent(classification: str | None) -> bool:
-    """Fail closed when moderation cannot classify a guest server message.
+    """Return True unless moderation produced a recognized classification.
 
-    This never means punishment is appropriate. It only means the message
-    must not bypass the required moderation stage and continue into Rem's
-    conversational agent without a valid moderation result.
+    This is a fail-closed routing rule, not a punishment decision. Only the
+    three labels emitted by the moderation classifier may proceed. Missing,
+    unavailable, malformed, or unexpected labels block the conversational agent
+    so an unmoderated guest message cannot bypass the mandatory moderation
+    stage. The caller must not infer that blocking means the user should be
+    punished.
     """
-    return str(classification or "UNAVAILABLE").strip().upper() == "UNAVAILABLE"
+    normalized = str(classification or "").strip().upper()
+    return normalized not in VALID_MODERATION_CLASSIFICATIONS

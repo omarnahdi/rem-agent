@@ -15,7 +15,9 @@ _EXPLICIT_VALUE_CUES = re.compile(
     r"i\s+(?:really\s+)?(?:like|love|prefer|hate|enjoy|play|main|use|work on|"
     r"am building|started|finished|plan to|want to|always|never|usually|often|"
     r"my goal is|my favourite is|my favorite is|am learning|study|work as)|"
+    r"i\s+am\s+(?:currently\s+)?(?:building|working on|learning|planning|trying|studying)|"
     r"i['’]m\s+(?:building|learning|working|planning|trying)|"
+    r"i['’]ve\s+been\s+(?:building|working on|learning|playing|using)|"
     r"our server|our community|we decided|we agreed|the event is|the event will be|"
     r"remember(?: that| this)?|don['’]t forget|do not forget|keep in mind|from now on|"
     r"actually,? i|correction:|update:)",
@@ -44,13 +46,21 @@ def should_consider_for_memory(
     *,
     message_count_24h: int,
     min_words: int = 7,
-    review_every: int = 5,
+    review_every: int = 10,
+    messages_since_review: int | None = None,
 ) -> bool:
-    """Return whether a message merits a curator pass.
+    """Decide whether to schedule a *batch* memory review.
 
-    A fast gate catches direct preference/project/event statements and longer
-    messages. Every Nth message gives the curator a chance to identify patterns
-    across recent messages. This gate never creates a memory itself.
+    Explicit preference/project/event/correction statements are reviewed promptly.
+    Otherwise, schedule a periodic review once enough new eligible events have
+    accumulated since the user's last successful review. The periodic trigger
+    deliberately does not require the latest message to be long: the curator
+    reviews a batch of recent author messages and channel context, so a short
+    current message can still close a batch containing useful indirect evidence.
+
+    ``message_count_24h`` remains for call-site compatibility and diagnostics.
+    New callers should pass ``messages_since_review``; legacy callers fall back
+    to the old modulo threshold until migrated. This function never stores a fact.
     """
     content = (text or "").strip()
     if not content or _URL_ONLY_OR_COMMAND.fullmatch(content):
@@ -59,11 +69,14 @@ def should_consider_for_memory(
         return False
     if _EXPLICIT_VALUE_CUES.search(content):
         return True
-    if count_words(content) >= max(1, min_words):
-        return True
-    if review_every > 0 and message_count_24h > 0 and message_count_24h % review_every == 0:
-        return True
-    return False
+
+    if review_every <= 0:
+        return False
+    if messages_since_review is not None:
+        return int(messages_since_review) >= int(review_every)
+    # Compatibility behavior for existing callers/tests that do not yet track a
+    # review watermark. The production memory service always supplies the count.
+    return message_count_24h > 0 and message_count_24h % review_every == 0
 
 
 

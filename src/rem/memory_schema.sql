@@ -38,6 +38,14 @@ CREATE TABLE IF NOT EXISTS rem_beta_memory_evidence (
     PRIMARY KEY (memory_id, raw_event_id)
 );
 
+CREATE TABLE IF NOT EXISTS rem_beta_memory_review_state (
+    discord_user_id TEXT NOT NULL,
+    guild_scope_id TEXT NOT NULL,
+    last_reviewed_event_id BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (discord_user_id, guild_scope_id)
+);
+
 CREATE TABLE IF NOT EXISTS rem_beta_curator_runs (
     discord_message_id TEXT PRIMARY KEY,
     raw_event_id BIGINT NOT NULL REFERENCES rem_beta_raw_events(id) ON DELETE CASCADE,

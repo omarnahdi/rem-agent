@@ -43,6 +43,9 @@ MEMORY QUALITY
   plans/commitments, useful corrections, and important facts about this Discord
   community. Prefer facts that will genuinely improve a later conversation.
 - Detect useful facts proactively; the user does not need to say "remember this".
+- This is a batch review: a single message may be ambiguous, so look for a stable
+  preference or project that emerges across several messages. A short latest message
+  may only be the last item in a meaningful sequence.
 - Do not save greetings, banter, one-off questions, transient moods, jokes,
   roleplay claims, insults, unsupported judgments, speculation, or every detail.
 - Never save credentials, passwords, API keys, private keys, recovery codes,
@@ -97,6 +100,12 @@ class RemMemoryService:
         self._mem0_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        # Coalesce qualifying events from the same member/guild into one curator
+        # call. This lets the curator find facts that only become clear across
+        # several messages while avoiding one model call per candidate message.
+        self._pending_curation_batches: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self._curation_batch_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
+        self._curation_retry_after: dict[tuple[str, str], float] = {}
         self._last_cleanup_monotonic = 0.0
         self._init_cooldown_until = 0.0
         self._init_failure_logged = False
@@ -256,23 +265,24 @@ class RemMemoryService:
         content: str,
         source_created_at: datetime,
         channel_context: str = "",
+        retrieve_memories: bool = True,
     ) -> str:
-        """Record the eligible Discord event, schedule curation, and recall memory.
+        """Observe a message, queue batch curation when warranted, and optionally recall.
 
-        Curating runs in a tracked background task, so the memory LLM call does
-        not delay Rem's normal Discord response. Failed curation never blocks chat.
+        Ordinary messages cause no Mem0 semantic search and no curator model call.
+        Explicit signals queue a short debounced review; otherwise, once enough
+        eligible messages have accumulated since the last successful review, the
+        curator evaluates recent messages from the author and the shared channel.
         """
         if not content.strip() or not await self.initialize():
             return ""
         assert self.pool is not None and self.mem0 is not None
 
-        # Do not retain obvious secrets/sensitive personal details in the raw
-        # evidence table. Memory retrieval can still run for the current reply.
         event_id: int | None = None
-        count_24h = 0
+        messages_since_review = 0
         inserted = False
         if should_record_raw_event(content):
-            event_id, count_24h, inserted = await self._record_event(
+            event_id, messages_since_review, inserted = await self._record_event(
                 message_id=message_id,
                 user_id=user_id,
                 guild_id=guild_id,
@@ -282,45 +292,44 @@ class RemMemoryService:
                 source_created_at=source_created_at,
             )
 
-        search_query = _build_search_query(content, channel_context)
-        user_memories = await self._search_scope(
-            query=search_query,
-            scope_type="user",
-            scope_id=str(user_id),
-            limit=5,
-        )
-        community_memories: list[dict[str, Any]] = []
-        if guild_id is not None:
-            community_memories = await self._search_scope(
-                query=search_query,
-                scope_type="community",
-                scope_id=str(guild_id),
-                limit=5,
+        qualifies_for_curation = bool(
+            event_id is not None
+            and inserted
+            and should_consider_for_memory(
+                content,
+                message_count_24h=messages_since_review,
+                messages_since_review=messages_since_review,
+                min_words=int(getattr(self.settings, "memory_min_words", 7)),
+                review_every=int(getattr(self.settings, "memory_review_every", 10)),
             )
+        )
 
-        if event_id is not None and inserted and should_consider_for_memory(
-            content,
-            message_count_24h=count_24h,
-            min_words=int(getattr(self.settings, "memory_min_words", 7)),
-            review_every=int(getattr(self.settings, "memory_review_every", 5)),
-        ):
-            already_processed = await self._has_successful_curation(str(message_id))
-            if not already_processed:
-                task = asyncio.create_task(
-                    self._curate_message(
-                        message_id=str(message_id),
-                        event_id=event_id,
-                        user_id=user_id,
-                        guild_id=guild_id,
-                        content=content[:4000],
-                        channel_context=(channel_context or "")[-6000:],
-                        initial_user_memories=user_memories,
-                        initial_community_memories=community_memories,
-                    ),
-                    name=f"rem-memory-curate-{message_id}",
+        # Semantic recall happens only when Rem is actually about to answer. The
+        # memory curator performs its own search once per batch, not once per event.
+        user_memories: list[dict[str, Any]] = []
+        community_memories: list[dict[str, Any]] = []
+        if retrieve_memories:
+            search_query = _build_search_query(content, channel_context)
+            user_memories = await self._search_scope(
+                query=search_query, scope_type="user", scope_id=str(user_id), limit=5
+            )
+            if guild_id is not None:
+                community_memories = await self._search_scope(
+                    query=search_query, scope_type="community", scope_id=str(guild_id), limit=5
                 )
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
+
+        if qualifies_for_curation:
+            self._queue_curation_candidate({
+                "message_id": str(message_id),
+                "event_id": int(event_id),
+                "user_id": int(user_id),
+                "guild_id": int(guild_id) if guild_id is not None else None,
+                "channel_id": int(channel_id),
+                "display_name": str(display_name)[:128],
+                "content": content[:4000],
+                "source_created_at": source_created_at,
+                "channel_context": (channel_context or "")[-6000:],
+            })
 
         now = time.monotonic()
         if now - self._last_cleanup_monotonic > 3600:
@@ -329,7 +338,75 @@ class RemMemoryService:
             task.add_done_callback(self._background_tasks.discard)
             self._last_cleanup_monotonic = now
 
+        if not retrieve_memories:
+            return ""
         return render_memory_context(user_memories, community_memories)
+
+    def _queue_curation_candidate(self, candidate: dict[str, Any]) -> None:
+        """Coalesce nearby triggers by member/server before spending curator tokens."""
+        guild_scope = str(candidate["guild_id"]) if candidate["guild_id"] is not None else "dm"
+        key = (guild_scope, str(candidate["user_id"]))
+        self._pending_curation_batches.setdefault(key, []).append(candidate)
+        existing = self._curation_batch_tasks.get(key)
+        if existing is None or existing.done():
+            self._start_curation_batch_task(key)
+
+    def _start_curation_batch_task(self, key: tuple[str, str]) -> None:
+        task = asyncio.create_task(self._flush_curation_batch(key), name=f"rem-memory-batch-{key[0]}-{key[1]}")
+        self._curation_batch_tasks[key] = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _flush_curation_batch(self, key: tuple[str, str]) -> None:
+        current_task = asyncio.current_task()
+        try:
+            window = max(2, int(getattr(self.settings, "memory_batch_window_seconds", 8)))
+            await asyncio.sleep(window)
+            retry_remaining = self._curation_retry_after.get(key, 0.0) - time.monotonic()
+            if retry_remaining > 0:
+                await asyncio.sleep(retry_remaining)
+
+            candidates = self._pending_curation_batches.pop(key, [])
+            if not candidates:
+                return
+
+            guild_scope, user_scope = key
+            guild_id = int(guild_scope) if guild_scope != "dm" else None
+            user_id = int(user_scope)
+            watermark = await self._last_reviewed_event_id(user_id=user_id, guild_id=guild_id)
+            # A concurrent review may already have covered some events while this
+            # batch waited. Do not spend another model call on those duplicates.
+            candidates = [item for item in candidates if int(item["event_id"]) > watermark]
+            if not candidates:
+                return
+            candidates.sort(key=lambda item: int(item["event_id"]))
+            latest = candidates[-1]
+            succeeded = await self._curate_message(
+                message_id=str(latest["message_id"]),
+                event_id=int(latest["event_id"]),
+                user_id=user_id,
+                guild_id=guild_id,
+                channel_id=int(latest["channel_id"]),
+                content=str(latest["content"]),
+                channel_context=str(latest.get("channel_context", "")),
+                batch_candidates=candidates,
+            )
+            if succeeded:
+                self._curation_retry_after.pop(key, None)
+            else:
+                # Don't hammer a broken provider/database. A new eligible event
+                # can queue another batch, but it waits before retrying.
+                self._curation_retry_after[key] = time.monotonic() + 60.0
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Rem memory batch scheduler failed | key=%s", key)
+            self._curation_retry_after[key] = time.monotonic() + 60.0
+        finally:
+            if self._curation_batch_tasks.get(key) is current_task:
+                self._curation_batch_tasks.pop(key, None)
+            if self._pending_curation_batches.get(key):
+                self._start_curation_batch_task(key)
 
     async def _record_event(
         self,
@@ -342,7 +419,9 @@ class RemMemoryService:
         content: str,
         source_created_at: datetime,
     ) -> tuple[int, int, bool]:
+        """Persist one eligible event and count events since the last review watermark."""
         assert self.pool is not None
+        guild_key = str(guild_id) if guild_id is not None else "dm"
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
@@ -364,16 +443,36 @@ class RemMemoryService:
                 )
             else:
                 event_id = row["id"]
-            count_24h = await conn.fetchval(
+            last_reviewed = await conn.fetchval(
+                """
+                SELECT last_reviewed_event_id FROM rem_beta_memory_review_state
+                WHERE discord_user_id = $1 AND guild_scope_id = $2
+                """,
+                str(user_id), guild_key,
+            )
+            count_since_review = await conn.fetchval(
                 """
                 SELECT COUNT(*) FROM rem_beta_raw_events
                 WHERE discord_user_id = $1
                   AND guild_id IS NOT DISTINCT FROM $2
-                  AND recorded_at >= NOW() - INTERVAL '24 hours'
+                  AND id > $3
                 """,
-                str(user_id), str(guild_id) if guild_id is not None else None,
+                str(user_id), str(guild_id) if guild_id is not None else None, int(last_reviewed or 0),
             )
-        return int(event_id), int(count_24h or 0), inserted
+        return int(event_id), int(count_since_review or 0), inserted
+
+    async def _last_reviewed_event_id(self, *, user_id: int, guild_id: int | None) -> int:
+        assert self.pool is not None
+        guild_key = str(guild_id) if guild_id is not None else "dm"
+        async with self.pool.acquire() as conn:
+            value = await conn.fetchval(
+                """
+                SELECT last_reviewed_event_id FROM rem_beta_memory_review_state
+                WHERE discord_user_id = $1 AND guild_scope_id = $2
+                """,
+                str(user_id), guild_key,
+            )
+        return int(value or 0)
 
     async def _search_scope(
         self, *, query: str, scope_type: str, scope_id: str, limit: int
@@ -451,11 +550,12 @@ class RemMemoryService:
         event_id: int,
         user_id: int,
         guild_id: int | None,
+        channel_id: int,
         content: str,
         channel_context: str,
-        initial_user_memories: list[dict[str, Any]],
-        initial_community_memories: list[dict[str, Any]],
-    ) -> None:
+        batch_candidates: list[dict[str, Any]],
+    ) -> bool:
+        """Curate one debounced batch; return whether the review completed successfully."""
         assert self.pool is not None and self.curator is not None
         try:
             async with self.pool.acquire() as conn:
@@ -469,31 +569,66 @@ class RemMemoryService:
                         started_at = NOW(), finished_at = NULL
                     WHERE rem_beta_curator_runs.status <> 'succeeded'
                     """,
-                    message_id,
-                    event_id,
+                    message_id, event_id,
                 )
                 run_row = await conn.fetchrow(
                     "SELECT status FROM rem_beta_curator_runs WHERE discord_message_id = $1",
                     message_id,
                 )
                 if run_row and run_row["status"] == "succeeded":
-                    return
+                    return True
 
             recent_user_events = await self._recent_user_events(user_id=user_id, guild_id=guild_id, limit=8)
+            recent_channel_events = await self._recent_channel_events(
+                guild_id=guild_id, channel_id=channel_id, limit=12
+            ) if guild_id is not None else []
+            queued_messages = [
+                {
+                    "message_id": str(item["message_id"]),
+                    "author_discord_id": str(item["user_id"]),
+                    "author": str(item["display_name"]),
+                    "content": str(item["content"])[:650],
+                    "source_created_at_utc": (
+                        item["source_created_at"].astimezone(timezone.utc).isoformat()
+                        if hasattr(item.get("source_created_at"), "astimezone")
+                        else str(item.get("source_created_at", ""))
+                    ),
+                }
+                for item in batch_candidates[-6:]
+            ]
+            search_text = "\n".join(
+                [str(item.get("content", "")) for item in recent_user_events[-5:]]
+                + [str(item.get("content", "")) for item in queued_messages]
+            )
+            search_query = _build_search_query(search_text or content, channel_context)
+            initial_user_memories = await self._search_scope(
+                query=search_query, scope_type="user", scope_id=str(user_id), limit=5
+            )
+            initial_community_memories: list[dict[str, Any]] = []
+            if guild_id is not None:
+                initial_community_memories = await self._search_scope(
+                    query=search_query, scope_type="community", scope_id=str(guild_id), limit=5
+                )
+
             prompt_payload = {
                 "current_author_discord_id": str(user_id),
                 "current_guild_id": str(guild_id) if guild_id is not None else None,
                 "current_message_id": message_id,
-                "current_message": content,
+                "current_message": content[:650],
+                "messages_that_triggered_this_batch": queued_messages,
                 "recent_messages_by_current_author": recent_user_events,
-                "recent_channel_context_for_reference_resolution_only": channel_context,
+                "recent_messages_in_this_channel_from_all_authors": recent_channel_events,
+                "recent_discord_context": (channel_context or "")[-3000:],
                 "related_active_user_memories": initial_user_memories,
                 "related_active_community_memories": initial_community_memories,
             }
             result = await self.curator.arun(
                 input=(
-                    "Decide whether this event creates or clearly updates useful long-term memory. "
-                    "Use only the provided message evidence. Return zero proposals if nothing qualifies.\n\n"
+                    "Review this batch of recent Discord evidence, not just the latest message. "
+                    "Look for durable facts that emerge indirectly across messages, recurring preferences, "
+                    "ongoing projects, corrections, and important shared community facts. Do not infer a "
+                    "personal fact about the current author from another author's words. Use the author IDs "
+                    "and message evidence to establish attribution. Return zero proposals if nothing qualifies.\n\n"
                     + json.dumps(prompt_payload, ensure_ascii=False, default=str)
                 )
             )
@@ -501,9 +636,19 @@ class RemMemoryService:
             if status == "ERROR":
                 raise RuntimeError("Agno memory curator returned ERROR status")
             decision = self._parse_decision(getattr(result, "content", None))
+            candidate_event_ids = [int(item["event_id"]) for item in batch_candidates]
+            user_evidence_ids = sorted({
+                int(event_id), *candidate_event_ids,
+                *(int(item["event_id"]) for item in recent_user_events if item.get("event_id") is not None),
+            })
+            community_evidence_ids = sorted({
+                int(event_id), *candidate_event_ids,
+                *(int(item["event_id"]) for item in recent_channel_events if item.get("event_id") is not None),
+            })
             outcomes: list[dict[str, Any]] = []
             for proposal in decision.proposals:
                 try:
+                    evidence_ids = user_evidence_ids if str(proposal.scope) == "user" else community_evidence_ids
                     outcome = await self._store_proposal(
                         proposal=proposal,
                         event_id=event_id,
@@ -511,30 +656,49 @@ class RemMemoryService:
                         guild_id=guild_id,
                         visible_user_memories=initial_user_memories,
                         visible_community_memories=initial_community_memories,
+                        evidence_event_ids=evidence_ids,
                     )
                     outcomes.append(outcome)
                 except Exception as exc:
                     logger.exception("Could not persist one Rem memory proposal | message_id=%s", message_id)
                     outcomes.append({"ok": False, "error_type": type(exc).__name__})
 
+            # Advance the watermark only after the review completed. Include the
+            # events visible to this review, but never messages added afterward.
+            reviewed_through = max(user_evidence_ids, default=int(event_id))
+            guild_scope = str(guild_id) if guild_id is not None else "dm"
             async with self.pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    UPDATE rem_beta_curator_runs
-                    SET status = 'succeeded', outcome = $2::jsonb, finished_at = NOW()
-                    WHERE discord_message_id = $1
-                    """,
-                    message_id,
-                    json.dumps(outcomes, ensure_ascii=False),
-                )
+                async with conn.transaction():
+                    await conn.execute(
+                        """
+                        UPDATE rem_beta_curator_runs
+                        SET status = 'succeeded', outcome = $2::jsonb, finished_at = NOW()
+                        WHERE discord_message_id = $1
+                        """,
+                        message_id, json.dumps(outcomes, ensure_ascii=False),
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO rem_beta_memory_review_state (
+                            discord_user_id, guild_scope_id, last_reviewed_event_id
+                        ) VALUES ($1, $2, $3)
+                        ON CONFLICT (discord_user_id, guild_scope_id) DO UPDATE SET
+                            last_reviewed_event_id = GREATEST(
+                                rem_beta_memory_review_state.last_reviewed_event_id,
+                                EXCLUDED.last_reviewed_event_id
+                            ),
+                            updated_at = NOW()
+                        """,
+                        str(user_id), guild_scope, reviewed_through,
+                    )
             logger.info(
-                "Memory curation completed | message_id=%s | proposals=%d | saved=%d",
-                message_id,
-                len(decision.proposals),
-                sum(1 for item in outcomes if item.get("ok") and item.get("stored")),
+                "Memory batch review completed | message_id=%s | batch_messages=%d | author_events=%d | channel_events=%d | proposals=%d | saved=%d",
+                message_id, len(batch_candidates), len(recent_user_events), len(recent_channel_events),
+                len(decision.proposals), sum(1 for item in outcomes if item.get("ok") and item.get("stored")),
             )
+            return True
         except Exception as exc:
-            logger.exception("Rem memory curation failed | message_id=%s", message_id)
+            logger.exception("Rem memory batch review failed | message_id=%s", message_id)
             try:
                 async with self.pool.acquire() as conn:
                     await conn.execute(
@@ -548,7 +712,8 @@ class RemMemoryService:
                         message_id, event_id, type(exc).__name__,
                     )
             except Exception:
-                logger.exception("Could not persist memory curation failure state | message_id=%s", message_id)
+                logger.exception("Could not persist memory batch review failure | message_id=%s", message_id)
+            return False
 
     def _parse_decision(self, content: Any) -> Any:
         if isinstance(content, self._decision_model):
@@ -566,21 +731,53 @@ class RemMemoryService:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT discord_message_id, author_display_name, content, source_created_at
+                SELECT id AS event_id, discord_message_id, author_display_name, content, source_created_at
                 FROM rem_beta_raw_events
                 WHERE discord_user_id = $1
                   AND guild_id IS NOT DISTINCT FROM $2
                   AND content <> ''
+                  AND recorded_at >= NOW() - INTERVAL '30 days'
                 ORDER BY source_created_at DESC, id DESC
                 LIMIT $3
                 """,
-                str(user_id), str(guild_id) if guild_id is not None else None, max(1, min(10, limit)),
+                str(user_id), str(guild_id) if guild_id is not None else None, max(1, min(8, limit)),
             )
         return [
             {
+                "event_id": int(row["event_id"]),
                 "message_id": str(row["discord_message_id"]),
                 "author": str(row["author_display_name"]),
-                "content": str(row["content"])[:1200],
+                "content": str(row["content"])[:800],
+                "source_created_at_utc": row["source_created_at"].astimezone(timezone.utc).isoformat(),
+            }
+            for row in reversed(rows)
+        ]
+
+    async def _recent_channel_events(
+        self, *, guild_id: int, channel_id: int, limit: int = 12
+    ) -> list[dict[str, Any]]:
+        """Fetch bounded, timestamped evidence from all authors in this channel."""
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id AS event_id, discord_message_id, discord_user_id,
+                       author_display_name, content, source_created_at
+                FROM rem_beta_raw_events
+                WHERE guild_id = $1 AND channel_id = $2 AND content <> ''
+                  AND recorded_at >= NOW() - INTERVAL '30 days'
+                ORDER BY source_created_at DESC, id DESC
+                LIMIT $3
+                """,
+                str(guild_id), str(channel_id), max(1, min(12, limit)),
+            )
+        return [
+            {
+                "event_id": int(row["event_id"]),
+                "message_id": str(row["discord_message_id"]),
+                "author_discord_id": str(row["discord_user_id"]),
+                "author": str(row["author_display_name"]),
+                "content": str(row["content"])[:600],
                 "source_created_at_utc": row["source_created_at"].astimezone(timezone.utc).isoformat(),
             }
             for row in reversed(rows)
@@ -595,6 +792,7 @@ class RemMemoryService:
         guild_id: int | None,
         visible_user_memories: list[dict[str, Any]],
         visible_community_memories: list[dict[str, Any]],
+        evidence_event_ids: list[int] | None = None,
     ) -> dict[str, Any]:
         assert self.pool is not None and self.mem0 is not None
         allowed, reason = validate_candidate(proposal, guild_id=guild_id)
@@ -683,9 +881,16 @@ class RemMemoryService:
                             scope_type, scope_id, mem0_user_id, inserted, fact_text,
                             category, float(proposal.confidence), float(proposal.importance), event_id, expires_at,
                         )
+                        evidence_ids = sorted({int(event_id), *(int(value) for value in (evidence_event_ids or []))})
                         await conn.execute(
-                            "INSERT INTO rem_beta_memory_evidence (memory_id, raw_event_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                            new_memory_id, event_id,
+                            """
+                            INSERT INTO rem_beta_memory_evidence (memory_id, raw_event_id)
+                            SELECT $1, source.id
+                            FROM rem_beta_raw_events AS source
+                            WHERE source.id = ANY($2::bigint[])
+                            ON CONFLICT DO NOTHING
+                            """,
+                            new_memory_id, evidence_ids,
                         )
                         if old_row is not None:
                             status = await conn.execute(
