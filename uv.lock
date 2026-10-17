@@ -544,6 +544,14 @@ wheels = [
 ]
 
 [[package]]
+name = "en-core-web-sm"
+version = "3.8.0"
+source = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }
+wheels = [
+    { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl", hash = "sha256:1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85" },
+]
+
+[[package]]
 name = "frozenlist"
 version = "1.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1590,6 +1598,7 @@ dependencies = [
     { name = "asyncpg" },
     { name = "ddgs" },
     { name = "discord-py" },
+    { name = "en-core-web-sm" },
     { name = "google-genai" },
     { name = "groq" },
     { name = "httpx" },
@@ -1606,6 +1615,7 @@ requires-dist = [
     { name = "asyncpg", specifier = ">=0.31.0" },
     { name = "ddgs", specifier = ">=9.0.0" },
     { name = "discord-py", specifier = ">=2.5,<3" },
+    { name = "en-core-web-sm", url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" },
     { name = "google-genai", specifier = ">=1.0.0" },
     { name = "groq", specifier = ">=0.30.0" },
     { name = "httpx", specifier = ">=0.27.0" },
