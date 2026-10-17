@@ -150,19 +150,17 @@ class RemAgnoDiscordClient(DiscordClient):
             source_channel_id = getattr(original_channel, "parent_id", None) or message_channel_id
         else:
             source_channel_id = message_channel_id
-        thread: Any
-        if isinstance(original_channel, discord.Thread):
-            thread = original_channel
-        elif isinstance(original_channel, discord.DMChannel):
-            thread = original_channel
-        elif isinstance(original_channel, discord.TextChannel):
-            try:
-                thread = await message.create_thread(name=f"{message.author.display_name}'s thread"[:100])
-            except (discord.Forbidden, discord.HTTPException):
-                logger.exception("Agno thread creation failed; replying in source channel | message_id=%s", message.id)
-                thread = original_channel
+        # Do not create a thread for ordinary channel messages. Reply in the
+        # channel where the user wrote; if the message is already in a thread,
+        # continue that existing thread. DMs continue in their DM channel.
+        if isinstance(original_channel, (discord.Thread, discord.DMChannel, discord.TextChannel)):
+            thread: Any = original_channel
         else:
-            logger.info("Ignored unsupported Discord channel type=%s id=%s", type(original_channel).__name__, getattr(original_channel, "id", None))
+            logger.info(
+                "Ignored unsupported Discord channel type=%s id=%s",
+                type(original_channel).__name__,
+                getattr(original_channel, "id", None),
+            )
             return
 
         conversation_channel_id = getattr(thread, "id", None)
