@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from agno.agent import Agent
 from agno.models.google import Gemini
@@ -20,6 +21,47 @@ from .youtube_tools import YouTubeSearchTools
 from .engagement import ENGAGEMENT_INSTRUCTIONS
 
 logger = logging.getLogger(__name__)
+
+
+def _build_web_search_tools(settings: Settings) -> list[Any]:
+    """Prefer Brave's authenticated Search API for general web results.
+
+    Agno's Brave toolkit currently exposes web results; retain Agno's news-only
+    search tool so the existing news capability is not silently removed. If the
+    optional Brave dependency is missing, fall back to the existing general +
+    news search toolkit rather than preventing Rem from starting.
+    """
+    if settings.brave_api_key:
+        try:
+            from agno.tools.bravesearch import BraveSearchTools
+        except ImportError:
+            logger.warning(
+                "BRAVE_API_KEY is set but agno.tools.bravesearch could not be imported; "
+                "install the brave-search dependency. Falling back to Agno WebSearchTools."
+            )
+        else:
+            logger.info(
+                "Brave Search API enabled for general web search; Agno news search remains enabled."
+            )
+            return [
+                BraveSearchTools(
+                    api_key=settings.brave_api_key,
+                    fixed_max_results=7,
+                    fixed_language="en",
+                ),
+                WebSearchTools(
+                    backend="auto",
+                    enable_search=False,
+                    enable_news=True,
+                    timeout=15,
+                ),
+            ]
+
+    if not settings.brave_api_key:
+        logger.info(
+            "BRAVE_API_KEY not configured; using Agno WebSearchTools auto backend for web and news search."
+        )
+    return [WebSearchTools(backend="auto", enable_search=True, enable_news=True, timeout=15)]
 
 
 def build_agent(settings: Settings, discord_client=None, *, vision_mode: bool = False, session_db=None, memory_service: RemMemoryService | None = None) -> Agent:
@@ -57,8 +99,9 @@ def build_agent(settings: Settings, discord_client=None, *, vision_mode: bool = 
         ScopedDiscordTools(bot_token=settings.discord_token or ""),
         # Discord.py actions absent from the built-in toolkit (reactions, timeout and context retrieval).
         RemDiscordActionTools(discord_client),
-        # Current Internet search for up-to-date Minecraft facts and general questions.
-        WebSearchTools(backend="auto", enable_search=True, enable_news=True, timeout=15),
+        # Prefer the official Brave Search API when BRAVE_API_KEY is configured;
+        # preserve news search using Agno's news-only WebSearchTools.
+        *_build_web_search_tools(settings),
         # Dedicated YouTube discovery, not video watching/transcription/inspection.
         YouTubeSearchTools(timeout=12),
         # Current Modrinth catalog search for mod suggestions.

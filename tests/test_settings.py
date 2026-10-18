@@ -75,6 +75,16 @@ class AgnoDebugSettingsTests(unittest.TestCase):
             configured = Settings.from_env(load_env_file=False)
         self.assertEqual(configured.curseforge_api_key, "test-key")
 
+    def test_brave_api_key_is_optional(self):
+        with patch.dict(os.environ, {}, clear=True):
+            settings = Settings.from_env(load_env_file=False)
+        self.assertIsNone(settings.brave_api_key)
+
+    def test_brave_api_key_is_loaded_when_set(self):
+        with patch.dict(os.environ, {"BRAVE_API_KEY": "brave-test-key"}, clear=True):
+            settings = Settings.from_env(load_env_file=False)
+        self.assertEqual(settings.brave_api_key, "brave-test-key")
+
 
     def test_engagement_is_enabled_by_default_with_low_cost_defaults(self):
         with patch.dict(os.environ, {}, clear=True):

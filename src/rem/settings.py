@@ -39,6 +39,8 @@ class Settings:
     engagement_batch_window_ms: int
     engagement_min_eval_interval_seconds: int
     memory_batch_window_seconds: int
+    # Appended with a default to preserve existing direct Settings construction.
+    brave_api_key: str | None = None
 
     @classmethod
     def from_env(cls, *, load_env_file: bool = True) -> "Settings":
@@ -107,6 +109,7 @@ class Settings:
             gemini_api_key=(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip() or None,
             gemini_model=os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip(),
             curseforge_api_key=os.getenv("CURSEFORGE_API_KEY", "").strip() or None,
+            brave_api_key=os.getenv("BRAVE_API_KEY", "").strip() or None,
             groq_api_key=os.getenv("GROQ_API_KEY", "").strip() or None,
             groq_rem_model=os.getenv("GROQ_REM_MODEL", DEFAULT_GROQ_REM_MODEL).strip(),
             groq_vision_model=os.getenv("GROQ_VISION_MODEL", DEFAULT_GROQ_VISION_MODEL).strip(),
