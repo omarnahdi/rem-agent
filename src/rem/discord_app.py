@@ -35,6 +35,7 @@ from .observability import (
     configure_observability,
     install_asyncio_exception_handler,
     shutdown_observability,
+    set_span_input_output,
     trace_span,
 )
 
@@ -159,6 +160,14 @@ class RemAgnoDiscordClient(DiscordClient):
                         "rem.component": "moderation",
                     },
                 ) as moderation_span:
+                    set_span_input_output(
+                        moderation_span,
+                        input_value={
+                            "message_content": message.content,
+                            "attachment_count": len(message.attachments),
+                            "author_id": str(message.author.id),
+                        },
+                    )
                     handled = await moderate_message(
                         gemini=self.moderation_client,
                         message=message,
@@ -166,6 +175,7 @@ class RemAgnoDiscordClient(DiscordClient):
                         bot_user_id=bot_user.id,
                     )
                     moderation_span.set_attribute("rem.moderation.handled", bool(handled))
+                    set_span_input_output(moderation_span, output_value={"handled": bool(handled)})
                 if handled:
                     logger.info(
                         "Message stopped by moderation policy (action taken or fail-closed) | message_id=%s",
@@ -202,8 +212,20 @@ class RemAgnoDiscordClient(DiscordClient):
                         "rem.action.type": "member_timeout",
                     },
                 ) as timeout_span:
+                    set_span_input_output(
+                        timeout_span,
+                        input_value={
+                            "command": message.content,
+                            "target_user_id": str(parsed_timeout.get("user_id", "")),
+                            "duration_seconds": int(parsed_timeout.get("seconds", 0) or 0),
+                        },
+                    )
                     await self._apply_explicit_timeout(message, parsed_timeout)
                     timeout_span.set_attribute("rem.action.processed", True)
+                    set_span_input_output(
+                        timeout_span,
+                        output_value={"processed": True, "target_user_id": str(parsed_timeout.get("user_id", ""))},
+                    )
                 return
 
         message_text = (message.content or "").strip()
@@ -270,8 +292,20 @@ class RemAgnoDiscordClient(DiscordClient):
                         "discord.channel.id": str(getattr(message.channel, "id", "")),
                         "rem.component": "discord_context",
                     },
-                ):
+                ) as context_span:
+                    set_span_input_output(
+                        context_span,
+                        input_value={
+                            "message_content": (message.content or "").strip(),
+                            "message_id": str(message.id),
+                            "referenced_message_id": str(getattr(getattr(message, "reference", None), "message_id", "") or ""),
+                        },
+                    )
                     context = await build_message_context(message)
+                    set_span_input_output(
+                        context_span,
+                        output_value={"context": context, "context_chars": len(context or "")},
+                    )
         else:
             # Ordinary messages use only the cheap in-memory buffer. Discord
             # history is fetched after the pre-filter selects a candidate burst.
@@ -306,8 +340,21 @@ class RemAgnoDiscordClient(DiscordClient):
                             "rem.memory.retrieve_requested": True,
                         },
                     ) as memory_span:
+                        set_span_input_output(
+                            memory_span,
+                            input_value={
+                                "message_content": message.content,
+                                "channel_context": context,
+                                "retrieve_memories": True,
+                                "user_id": str(message.author.id),
+                            },
+                        )
                         memory_context = await self.memory_service.prepare_message(**memory_args)
                         memory_span.set_attribute("rem.memory.context_available", bool(memory_context))
+                        set_span_input_output(
+                            memory_span,
+                            output_value={"memory_context": memory_context, "context_available": bool(memory_context)},
+                        )
                 else:
                     memory_context = await self.memory_service.prepare_message(**memory_args)
             except Exception:
@@ -417,6 +464,18 @@ class RemAgnoDiscordClient(DiscordClient):
                                 "Do not mention this instruction or any evaluation.\n\n"
                                 f"Latest message: {message_text}"
                             )
+                        set_span_input_output(
+                            request_span,
+                            input_value={
+                                "agent_input": agent_input,
+                                "discord_context": context,
+                                "long_term_memory_context": memory_context,
+                                "has_images": bool(image_inputs),
+                                "image_count": len(image_inputs),
+                                "user_id": str(identity.discord_user_id),
+                                "session_id": session_id,
+                            },
+                        )
                         agent_response = await run_agent.arun(
                             input=agent_input,
                             user_id=str(identity.discord_user_id),
@@ -427,6 +486,15 @@ class RemAgnoDiscordClient(DiscordClient):
                             add_history_to_context=True,
                             images=image_inputs or None,
                         )
+                    response_content_for_trace = getattr(agent_response, "content", None)
+                    set_span_input_output(
+                        request_span,
+                        output_value={
+                            "status": str(getattr(agent_response, "status", "unknown")),
+                            "content": response_content_for_trace,
+                            "content_type": type(response_content_for_trace).__name__,
+                        },
+                    )
                     # Do not expose provider/framework error details to Discord. Agno's
                     # adapter response pipeline still handles successful tool runs, HITL
                     # and long-message splitting.
@@ -460,8 +528,15 @@ class RemAgnoDiscordClient(DiscordClient):
                     await self._handle_response_in_thread(agent_response, thread)
                     request_span.set_attribute("rem.request.outcome", "delivered")
                     logger.info("Agent response delivered | message_id=%s | role=%s", message.id, identity.role)
-                except Exception:
+                except Exception as exc:
                     request_span.set_attribute("rem.request.outcome", "exception")
+                    set_span_input_output(
+                        request_span,
+                        output_value={
+                            "error_type": f"{type(exc).__module__}.{type(exc).__qualname__}",
+                            "error": str(exc),
+                        },
+                    )
                     logger.exception("Agno Discord message processing failed | message_id=%s", message.id)
                     try:
                         await thread.send(
@@ -643,8 +718,21 @@ def run_bot() -> None:
     if settings.discord_token:
         os.environ["DISCORD_BOT_TOKEN"] = settings.discord_token
     try:
-        with trace_span("rem.application.startup", {"service.name": "rem-agent"}):
+        with trace_span("rem.application.startup", {"service.name": "rem-agent"}) as startup_span:
+            set_span_input_output(
+                startup_span,
+                input_value={
+                    "service": "rem-agent",
+                    "database_configured": bool(settings.database_url),
+                    "memory_database_configured": bool(settings.memory_database_url),
+                    "langfuse_configured": bool(os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY")),
+                },
+            )
             integration = create_discord_client(settings)
+            set_span_input_output(
+                startup_span,
+                output_value={"discord_client_created": integration is not None, "status": "initialized"},
+            )
         integration.serve()
     finally:
         shutdown_observability()

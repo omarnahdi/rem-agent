@@ -19,6 +19,7 @@ from .persona import SYSTEM_INSTRUCTIONS
 from .settings import Settings
 from .youtube_tools import YouTubeSearchTools
 from .engagement import ENGAGEMENT_INSTRUCTIONS
+from .observability import langfuse_tool_hook
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ def _build_web_search_tools(settings: Settings) -> list[Any]:
             return [
                 BraveSearchTools(
                     api_key=settings.brave_api_key,
-                    fixed_max_results=7,
+                    fixed_max_results=5,
                     fixed_language="en",
                 ),
                 WebSearchTools(
@@ -129,6 +130,9 @@ def build_agent(settings: Settings, discord_client=None, *, vision_mode: bool = 
         debug_mode=settings.agno_debug_mode,
         debug_level=settings.agno_debug_level,
         tool_call_limit=8,
+        # Add explicit input/output fields to existing OpenInference TOOL spans;
+        # create rem.tool.* spans only when automatic instrumentation has none.
+        tool_hooks=[langfuse_tool_hook],
         # We intentionally do not mutate Agent.additional_context per message.
     )
 

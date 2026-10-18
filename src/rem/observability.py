@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
+import json
 import logging
 import os
 import re
@@ -37,7 +39,7 @@ _SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
     re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b"),
     re.compile(r"\b(?:mfa\.[A-Za-z0-9_-]{20,}|[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,})\b"),
-    re.compile(r"(?i)(\b[A-Z0-9_]*(?:API[_ -]?KEY|SECRET[_ -]?KEY|ACCESS[_ -]?TOKEN|REFRESH[_ -]?TOKEN|PASSWORD|AUTHORIZATION)\b\s*[:=]\s*)([^\s,;]+)"),
+    re.compile(r'''(?i)(["']?\b[A-Z0-9_]*(?:API[_ -]?KEY|SECRET[_ -]?KEY|ACCESS[_ -]?TOKEN|REFRESH[_ -]?TOKEN|PASSWORD|AUTHORIZATION)\b["']?\s*[:=]\s*["']?)([^"'\s,;}{]+)(["']?)'''),
     re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]+"),
 )
 
@@ -84,7 +86,7 @@ def sanitize_telemetry_text(value: object, *, limit: int = 6000) -> str:
     # Strip bearer credentials before generic key=value redaction; otherwise
     # "Authorization: Bearer <token>" would redact only the word "Bearer".
     text = _SECRET_PATTERNS[4].sub(r"\1[REDACTED_SECRET]", text)
-    text = _SECRET_PATTERNS[3].sub(r"\1[REDACTED_SECRET]", text)
+    text = _SECRET_PATTERNS[3].sub(r"\1[REDACTED_SECRET]\3", text)
     if len(text) > limit:
         text = text[:limit] + "…[truncated]"
     return text
@@ -209,6 +211,29 @@ class LangfuseLoggingHandler(logging.Handler):
             self._local.busy = False
 
 
+def set_span_error(span: Any, exc: BaseException) -> None:
+    """Mark a span failed and attach a bounded, credential-scrubbed exception."""
+    try:
+        from opentelemetry.trace import Status, StatusCode
+
+        message = sanitize_telemetry_text(exc, limit=2000)
+        span.add_event(
+            "exception",
+            attributes={
+                "exception.type": f"{type(exc).__module__}.{type(exc).__qualname__}",
+                "exception.message": message,
+                "exception.escaped": True,
+                "exception.stacktrace": sanitize_telemetry_text(
+                    "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+                    limit=6000,
+                ),
+            },
+        )
+        span.set_status(Status(StatusCode.ERROR, message[:500]))
+    except Exception:
+        pass
+
+
 @contextmanager
 def trace_span(name: str, attributes: dict[str, Any] | None = None) -> Iterator[Any]:
     """Create a low-overhead app span that degrades safely when tracing is off."""
@@ -228,29 +253,148 @@ def trace_span(name: str, attributes: dict[str, Any] | None = None) -> Iterator[
         try:
             yield span
         except Exception as exc:
-            # Avoid the default OpenTelemetry exception recorder here because
-            # raw exception strings can contain user-provided text or secrets.
-            try:
-                from opentelemetry.trace import Status, StatusCode
-
-                message = sanitize_telemetry_text(exc, limit=2000)
-                span.add_event(
-                    "exception",
-                    attributes={
-                        "exception.type": f"{type(exc).__module__}.{type(exc).__qualname__}",
-                        "exception.message": message,
-                        "exception.escaped": True,
-                        "exception.stacktrace": sanitize_telemetry_text(
-                            "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
-                            limit=6000,
-                        ),
-                    },
-                )
-                span.set_status(Status(StatusCode.ERROR, message[:500]))
-            except Exception:
-                pass
+            # Avoid the default OpenTelemetry exception recorder because raw
+            # exception strings can contain user-provided text or secrets.
+            set_span_error(span, exc)
             raise
 
+
+
+_UNSET = object()
+
+
+def _serialize_observation_value(value: Any, *, limit: int = 12000) -> tuple[str, str]:
+    """Serialize a value for Langfuse's input.value/output.value fields."""
+    if isinstance(value, bytes):
+        rendered = f"[binary payload: {len(value)} bytes]"
+        mime_type = "text/plain"
+    elif isinstance(value, str):
+        rendered = value
+        mime_type = "text/plain"
+    else:
+        try:
+            rendered = json.dumps(value, ensure_ascii=False, default=lambda item: repr(item))
+        except Exception:
+            rendered = repr(value)
+        mime_type = "application/json"
+    return sanitize_telemetry_text(rendered, limit=limit), mime_type
+
+
+def set_span_input_output(
+    span: Any,
+    *,
+    input_value: Any = _UNSET,
+    output_value: Any = _UNSET,
+    limit: int = 12000,
+) -> None:
+    """Populate Langfuse-visible input/output fields, respecting content capture.
+
+    OpenInference's TraceConfig only affects automatically instrumented spans;
+    our custom OTel spans must be redacted or populated explicitly.
+    """
+    capture_content = _truthy_env("LANGFUSE_CAPTURE_CONTENT", default=False)
+    for direction, value in (("input", input_value), ("output", output_value)):
+        if value is _UNSET:
+            continue
+        if capture_content:
+            rendered, mime_type = _serialize_observation_value(value, limit=limit)
+            span.set_attribute(f"{direction}.value", rendered)
+            span.set_attribute(f"{direction}.mime_type", mime_type)
+        else:
+            span.set_attribute(f"{direction}.value", "__REDACTED__")
+
+
+def _active_tool_span() -> Any | None:
+    """Return the current OI TOOL span, when Agno's instrumentor made one."""
+    try:
+        from opentelemetry import trace
+
+        span = trace.get_current_span()
+        if not _span_is_valid(span):
+            return None
+        attrs = getattr(span, "attributes", None) or getattr(span, "_attributes", None) or {}
+        kind = str(attrs.get("openinference.span.kind", "")).upper()
+        if kind == "TOOL" or attrs.get("tool.name"):
+            return span
+    except Exception:
+        return None
+    return None
+
+
+def _record_tool_result(span: Any, value: Any) -> None:
+    set_span_input_output(span, output_value=value)
+
+
+def langfuse_tool_hook(function_name: str, func: Any, args: dict[str, Any]) -> Any:
+    """Agno tool-hook middleware that guarantees visible tool input/output.
+
+    If OpenInference already created a TOOL span, enrich it instead of adding a
+    duplicate. Otherwise create a Rem TOOL span around the actual function call.
+    The hook supports synchronous and asynchronous tool entrypoints.
+    """
+    active_tool_span = _active_tool_span()
+
+    if active_tool_span is not None:
+        set_span_input_output(active_tool_span, input_value=args)
+        target_span = active_tool_span
+        span_context = None
+    else:
+        safe_name = sanitize_telemetry_text(function_name, limit=120).replace(" ", "_")
+        span_name = f"rem.tool.{safe_name}"
+        span_attrs = {
+            "openinference.span.kind": "TOOL",
+            "tool.name": sanitize_telemetry_text(function_name, limit=200),
+            "rem.component": "tool_execution",
+        }
+        span_context = trace_span(span_name, span_attrs)
+        target_span = span_context.__enter__()
+        set_span_input_output(target_span, input_value=args)
+
+    def close_context() -> None:
+        if span_context is not None:
+            span_context.__exit__(None, None, None)
+
+    def handle_error(exc: Exception) -> None:
+        _record_tool_result(
+            target_span,
+            {"error_type": f"{type(exc).__module__}.{type(exc).__qualname__}", "error": sanitize_telemetry_text(exc, limit=3000)},
+        )
+        set_span_error(target_span, exc)
+        close_context()
+
+    if inspect.iscoroutinefunction(func):
+        async def _execute_async_tool() -> Any:
+            try:
+                result = await func(**args)
+            except Exception as exc:
+                handle_error(exc)
+                raise
+            _record_tool_result(target_span, result)
+            close_context()
+            return result
+        return _execute_async_tool()
+
+    try:
+        result = func(**args)
+    except Exception as exc:
+        handle_error(exc)
+        raise
+
+    if inspect.isawaitable(result):
+        async def _await_unmarked_coroutine() -> Any:
+            try:
+                resolved = await result
+            except Exception as exc:
+                handle_error(exc)
+                raise
+            _record_tool_result(target_span, resolved)
+            close_context()
+            return resolved
+        return _await_unmarked_coroutine()
+
+    _record_tool_result(target_span, result)
+    close_context()
+    return result
 
 def _truthy_env(name: str, *, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -346,7 +490,7 @@ def configure_observability(*, service_name: str = "rem-agent") -> bool:
                 hide_outputs=not capture_content,
                 hide_input_messages=not capture_content,
                 hide_output_messages=not capture_content,
-                hide_input_images=True,
+                hide_input_images=not capture_content,
             )
             AgnoInstrumentor().instrument(tracer_provider=provider, config=config)
             instrumentor_active = True
