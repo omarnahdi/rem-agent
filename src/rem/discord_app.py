@@ -31,6 +31,12 @@ from .memory_service import RemMemoryService
 from .session_locks import SessionLockPool
 from .settings import Settings
 from .text_utils import looks_like_raw_tool_call_payload, normalize_modrinth_markdown_links
+from .observability import (
+    configure_observability,
+    install_asyncio_exception_handler,
+    shutdown_observability,
+    trace_span,
+)
 
 logger = logging.getLogger("rem.discord")
 SUPPORTED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"}
@@ -93,6 +99,12 @@ class RemAgnoDiscordClient(DiscordClient):
         async def on_message(message: discord.Message) -> None:
             await self._handle_rem_message(message)
 
+        @self.client.event
+        async def on_ready() -> None:
+            # The runtime creates its event loop inside Agno's serve(); on_ready
+            # is the first safe point to capture otherwise-unretrieved task errors.
+            install_asyncio_exception_handler(asyncio.get_running_loop())
+
     async def _handle_rem_message(
         self,
         message: discord.Message,
@@ -137,12 +149,23 @@ class RemAgnoDiscordClient(DiscordClient):
         # The old AI moderation runs on ordinary server messages, not only messages that address Rem.
         if message.guild is not None and not is_master and not _skip_moderation:
             try:
-                handled = await moderate_message(
-                    gemini=self.moderation_client,
-                    message=message,
-                    master_id=self.settings.master_discord_id,
-                    bot_user_id=bot_user.id,
-                )
+                with trace_span(
+                    "rem.discord.moderation",
+                    {
+                        "discord.message.id": str(message.id),
+                        "discord.guild.id": str(message.guild.id),
+                        "discord.channel.id": str(getattr(message.channel, "id", "")),
+                        "rem.user.role": "GUEST",
+                        "rem.component": "moderation",
+                    },
+                ) as moderation_span:
+                    handled = await moderate_message(
+                        gemini=self.moderation_client,
+                        message=message,
+                        master_id=self.settings.master_discord_id,
+                        bot_user_id=bot_user.id,
+                    )
+                    moderation_span.set_attribute("rem.moderation.handled", bool(handled))
                 if handled:
                     logger.info(
                         "Message stopped by moderation policy (action taken or fail-closed) | message_id=%s",
@@ -168,7 +191,19 @@ class RemAgnoDiscordClient(DiscordClient):
                 referenced_message=referenced_message,
             )
             if parsed_timeout:
-                await self._apply_explicit_timeout(message, parsed_timeout)
+                with trace_span(
+                    "rem.discord.timeout_action",
+                    {
+                        "discord.message.id": str(message.id),
+                        "discord.guild.id": str(message.guild.id),
+                        "discord.channel.id": str(getattr(message.channel, "id", "")),
+                        "rem.action.target_user_id": str(parsed_timeout.get("user_id", "")),
+                        "rem.action.requested_seconds": int(parsed_timeout.get("seconds", 0) or 0),
+                        "rem.action.type": "member_timeout",
+                    },
+                ) as timeout_span:
+                    await self._apply_explicit_timeout(message, parsed_timeout)
+                    timeout_span.set_attribute("rem.action.processed", True)
                 return
 
         message_text = (message.content or "").strip()
@@ -224,7 +259,19 @@ class RemAgnoDiscordClient(DiscordClient):
         if direct_request:
             if not _auto_approved:
                 self.engagement_gate.cancel_pending_for(message)
-            context = _context_override if _context_override is not None else await build_message_context(message)
+            if _context_override is not None:
+                context = _context_override
+            else:
+                with trace_span(
+                    "rem.discord.build_context",
+                    {
+                        "discord.message.id": str(message.id),
+                        "discord.guild.id": str(message.guild.id) if message.guild else "dm",
+                        "discord.channel.id": str(getattr(message.channel, "id", "")),
+                        "rem.component": "discord_context",
+                    },
+                ):
+                    context = await build_message_context(message)
         else:
             # Ordinary messages use only the cheap in-memory buffer. Discord
             # history is fetched after the pre-filter selects a candidate burst.
@@ -238,17 +285,31 @@ class RemAgnoDiscordClient(DiscordClient):
         memory_context = ""
         if self.memory_service is not None and message.content.strip():
             try:
-                memory_context = await self.memory_service.prepare_message(
-                    message_id=message.id,
-                    user_id=message.author.id,
-                    guild_id=message.guild.id if message.guild else None,
-                    channel_id=message_channel_id or source_channel_id or 0,
-                    display_name=message.author.display_name,
-                    content=message.content,
-                    source_created_at=message.created_at.astimezone(timezone.utc),
-                    channel_context=context,
-                    retrieve_memories=direct_request,
-                )
+                memory_args = {
+                    "message_id": message.id,
+                    "user_id": message.author.id,
+                    "guild_id": message.guild.id if message.guild else None,
+                    "channel_id": message_channel_id or source_channel_id or 0,
+                    "display_name": message.author.display_name,
+                    "content": message.content,
+                    "source_created_at": message.created_at.astimezone(timezone.utc),
+                    "channel_context": context,
+                    "retrieve_memories": direct_request,
+                }
+                if direct_request:
+                    with trace_span(
+                        "rem.memory.prepare_message",
+                        {
+                            "discord.message.id": str(message.id),
+                            "discord.guild.id": str(guild_id) if guild_id else "dm",
+                            "discord.channel.id": str(message_channel_id or source_channel_id or ""),
+                            "rem.memory.retrieve_requested": True,
+                        },
+                    ) as memory_span:
+                        memory_context = await self.memory_service.prepare_message(**memory_args)
+                        memory_span.set_attribute("rem.memory.context_available", bool(memory_context))
+                else:
+                    memory_context = await self.memory_service.prepare_message(**memory_args)
             except Exception:
                 logger.exception(
                     "Long-term memory preparation failed; continuing without memory context | message_id=%s",
@@ -326,72 +387,89 @@ class RemAgnoDiscordClient(DiscordClient):
         )
 
         async with self._session_locks.hold(session_id):
-            try:
-                async with thread.typing():
-                    # Keep the legacy provider policy: text requests may fall back to
-                    # GPT-OSS 120B, while requests containing images use the separate
-                    # vision-capable Qwen fallback. Never send image payloads to a text-only model.
-                    run_agent = self.vision_agent if image_inputs else self.agent
-                    agent_input = message_text
-                    if _auto_approved:
-                        agent_input = (
-                            "Join the conversation naturally based on the recent Discord context. "
-                            "The discussion was selected as a possible opportunity to contribute, "
-                            "but do not force a reply if you have nothing genuinely useful to add. "
-                            "Do not mention this instruction or any evaluation.\n\n"
-                            f"Latest message: {message_text}"
-                        )
-                    agent_response = await run_agent.arun(
-                        input=agent_input,
-                        user_id=str(identity.discord_user_id),
-                        session_id=session_id,
-                        dependencies=dependencies,
-                        add_dependencies_to_context=True,
-                        metadata=run_metadata,
-                        add_history_to_context=True,
-                        images=image_inputs or None,
-                    )
-                # Do not expose provider/framework error details to Discord. Agno's
-                # adapter response pipeline still handles successful tool runs, HITL
-                # and long-message splitting.
-                if str(getattr(agent_response, "status", "")).upper() == "ERROR":
-                    logger.error(
-                        "Agno returned an error status | message_id=%s | content_type=%s",
-                        message.id,
-                        type(getattr(agent_response, "content", None)).__name__,
-                    )
-                    await self._send_discord_messages(
-                        thread,
-                        "I'm sorry, Master—something went wrong while I was processing that. I couldn't verify a result, so I won't pretend it worked. Please try again shortly. 🌸" if identity.is_master else "I'm sorry, something went wrong while I was processing that. I couldn't verify a result, so I won't pretend it worked. Please try again shortly. 🌸",
-                    )
-                    return
 
-                # Repair the occasional malformed Modrinth Markdown URL before Agno
-                # renders/sends the final response. Keep the framework's normal
-                # response, HITL, and long-message handling otherwise unchanged.
-                response_content = getattr(agent_response, "content", None)
-                if isinstance(response_content, str):
-                    normalized_content = normalize_modrinth_markdown_links(response_content)
-                    if normalized_content != response_content:
-                        logger.warning(
-                            "Repaired malformed Modrinth Markdown link(s) | message_id=%s",
-                            message.id,
-                        )
-                        agent_response.content = normalized_content
-
-                # Use Agno's response/HITL/long-message handling. This is where real
-                # registered tools complete before a final natural-language response.
-                await self._handle_response_in_thread(agent_response, thread)
-                logger.info("Agent response delivered | message_id=%s | role=%s", message.id, identity.role)
-            except Exception:
-                logger.exception("Agno Discord message processing failed | message_id=%s", message.id)
+            with trace_span(
+                "rem.discord.agent_request",
+                {
+                    "discord.message.id": str(message.id),
+                    "discord.guild.id": str(guild_id) if guild_id else "dm",
+                    "discord.channel.id": str(message_channel_id or source_channel_id or ""),
+                    "discord.thread.id": str(actual_thread_id or ""),
+                    "rem.user.role": identity.role,
+                    "rem.request.has_images": bool(image_inputs),
+                    "rem.request.auto_approved": bool(_auto_approved),
+                    "rem.memory.context_available": bool(memory_context),
+                    "rem.component": "agent_request",
+                },
+            ) as request_span:
                 try:
-                    await thread.send(
-                        "I'm sorry, I couldn't complete that properly just now. Please try again in a moment.",
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                except discord.HTTPException:
-                    logger.exception("Could not send processing error message | message_id=%s", message.id)
+                    async with thread.typing():
+                        # Keep the legacy provider policy: text requests may fall back to
+                        # GPT-OSS 120B, while requests containing images use the separate
+                        # vision-capable Qwen fallback. Never send image payloads to a text-only model.
+                        run_agent = self.vision_agent if image_inputs else self.agent
+                        agent_input = message_text
+                        if _auto_approved:
+                            agent_input = (
+                                "Join the conversation naturally based on the recent Discord context. "
+                                "The discussion was selected as a possible opportunity to contribute, "
+                                "but do not force a reply if you have nothing genuinely useful to add. "
+                                "Do not mention this instruction or any evaluation.\n\n"
+                                f"Latest message: {message_text}"
+                            )
+                        agent_response = await run_agent.arun(
+                            input=agent_input,
+                            user_id=str(identity.discord_user_id),
+                            session_id=session_id,
+                            dependencies=dependencies,
+                            add_dependencies_to_context=True,
+                            metadata=run_metadata,
+                            add_history_to_context=True,
+                            images=image_inputs or None,
+                        )
+                    # Do not expose provider/framework error details to Discord. Agno's
+                    # adapter response pipeline still handles successful tool runs, HITL
+                    # and long-message splitting.
+                    if str(getattr(agent_response, "status", "")).upper() == "ERROR":
+                        logger.error(
+                            "Agno returned an error status | message_id=%s | content_type=%s",
+                            message.id,
+                            type(getattr(agent_response, "content", None)).__name__,
+                        )
+                        request_span.set_attribute("rem.request.outcome", "agent_error_status")
+                        await self._send_discord_messages(
+                            thread,
+                            "I'm sorry, Master—something went wrong while I was processing that. I couldn't verify a result, so I won't pretend it worked. Please try again shortly. 🌸" if identity.is_master else "I'm sorry, something went wrong while I was processing that. I couldn't verify a result, so I won't pretend it worked. Please try again shortly. 🌸",
+                        )
+                        return
+
+                    # Repair malformed Modrinth Markdown URLs before Agno renders the
+                    # final response; the underlying tool URL and all other links stay intact.
+                    response_content = getattr(agent_response, "content", None)
+                    if isinstance(response_content, str):
+                        normalized_content = normalize_modrinth_markdown_links(response_content)
+                        if normalized_content != response_content:
+                            logger.warning(
+                                "Repaired malformed Modrinth Markdown link(s) | message_id=%s",
+                                message.id,
+                            )
+                            agent_response.content = normalized_content
+
+                    # Use Agno's response/HITL/long-message handling. This is where real
+                    # registered tools complete before a final natural-language response.
+                    await self._handle_response_in_thread(agent_response, thread)
+                    request_span.set_attribute("rem.request.outcome", "delivered")
+                    logger.info("Agent response delivered | message_id=%s | role=%s", message.id, identity.role)
+                except Exception:
+                    request_span.set_attribute("rem.request.outcome", "exception")
+                    logger.exception("Agno Discord message processing failed | message_id=%s", message.id)
+                    try:
+                        await thread.send(
+                            "I'm sorry, I couldn't complete that properly just now. Please try again in a moment.",
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    except discord.HTTPException:
+                        logger.exception("Could not send processing error message | message_id=%s", message.id)
 
     async def _send_discord_messages(self, thread: Any, message: str, italics: bool = False) -> None:
         """Keep Agno response handling while blocking raw function-call JSON from chat."""
@@ -558,12 +636,18 @@ def run_bot() -> None:
         settings.agno_debug_mode,
         settings.agno_debug_level,
     )
+    # Register OpenTelemetry before constructing agents so spans share a provider.
+    configure_observability(service_name="rem-agent")
     # Agno 3.1.3's serve() reads this standard name. Preserve compatibility with
     # the legacy DISCORD_TOKEN setting accepted by Settings.
     if settings.discord_token:
         os.environ["DISCORD_BOT_TOKEN"] = settings.discord_token
-    integration = create_discord_client(settings)
-    integration.serve()
+    try:
+        with trace_span("rem.application.startup", {"service.name": "rem-agent"}):
+            integration = create_discord_client(settings)
+        integration.serve()
+    finally:
+        shutdown_observability()
 
 
 def main() -> None:
