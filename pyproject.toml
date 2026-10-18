@@ -22,6 +22,7 @@ dependencies = [
   "opentelemetry-exporter-otlp-proto-http>=1.45.1",
   "openinference-instrumentation-agno>=1.0.15",
   "openinference-instrumentation>=0.1.71",
+  "brave-search",
 ]
 
 [project.scripts]
@@ -40,3 +41,4 @@ package = true
 
 [tool.uv.sources]
 en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }
+brave-search = { git = "https://github.com/omarnahdi/brave-api-fix.git" }
