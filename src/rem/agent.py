@@ -105,7 +105,8 @@ def build_agent(settings: Settings, discord_client=None, *, vision_mode: bool = 
         *_build_web_search_tools(settings),
         # Dedicated YouTube discovery, not video watching/transcription/inspection.
         YouTubeSearchTools(timeout=12),
-        # Current Modrinth catalog search for mod suggestions.
+        # Current Modrinth catalog search for mods, resource packs, data packs, shaders, and modpacks.
+        # The toolkit injects its own detailed usage instructions into Rem's context.
         ModrinthSearchTools(timeout=12),
         # Official CurseForge Minecraft mod catalogue; requires an optional API key.
         CurseForgeSearchTools(api_key=settings.curseforge_api_key, timeout=12),
