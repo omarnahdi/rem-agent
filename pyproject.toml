@@ -23,6 +23,7 @@ dependencies = [
   "openinference-instrumentation-agno>=1.0.15",
   "openinference-instrumentation>=0.1.71",
   "brave-search",
+  "pydantic>=2.7,<3",
 ]
 
 [project.scripts]

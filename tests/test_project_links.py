@@ -75,6 +75,22 @@ class ProjectLinkNormalizationTests(unittest.TestCase):
             f"[JourneyMap]({JOURNEYMAP})",
         )
 
+    def test_collects_urls_from_tool_messages_when_aggregate_tools_are_empty(self):
+        result = {
+            "ok": True,
+            "query": "sodium",
+            "results": [{"title": "Sodium", "slug": "sodium", "url": SODIUM}],
+            "source": "Modrinth public API",
+        }
+        message = SimpleNamespace(role="tool", name="search_modrinth_projects", content=json.dumps(result))
+        output = SimpleNamespace(tools=[], events=[], messages=[message])
+        links = collect_verified_project_links(output)
+        self.assertEqual(links["sodium"], SODIUM)
+        self.assertEqual(
+            normalize_project_markdown_links("[Sodium](https://modrinth.com/mod/not-sodium)**", links),
+            f"[Sodium]({SODIUM})",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

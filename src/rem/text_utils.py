@@ -118,52 +118,88 @@ def _iter_mapping_nodes(value: Any):
             yield from _iter_mapping_nodes(child)
 
 
-def collect_verified_project_links(run_output: Any) -> dict[str, str]:
-    """Build label/slug -> canonical URL mappings from actual Modrinth/CurseForge tool results.
+def _read_value(value: Any, *names: str) -> Any:
+    """Read a field from either an Agno/Pydantic object or a mapping."""
+    for name in names:
+        if isinstance(value, dict):
+            candidate = value.get(name)
+        else:
+            candidate = getattr(value, name, None)
+        if candidate is not None:
+            return candidate
+    return None
 
-    Only successful project-search tool outputs are considered. The model's prose is
-    deliberately not treated as evidence of a valid URL.
+
+def _tool_source_name(value: Any) -> str:
+    """Extract the registered function name from Agno tool/event/message shapes."""
+    direct = _read_value(value, "tool_name", "name", "function_name")
+    nested = _read_value(value, "tool", "function", "tool_call")
+    if nested is not None:
+        direct = direct or _read_value(nested, "tool_name", "name", "function_name")
+        function = _read_value(nested, "function")
+        if function is not None:
+            direct = direct or _read_value(function, "name")
+    return str(direct or "").casefold()
+
+
+def collect_verified_project_links(run_output: Any) -> dict[str, str]:
+    """Build label/slug -> canonical URL mappings from actual search-tool results.
+
+    Agno versions differ in where completed tool results are exposed: some store
+    them in ``RunOutput.tools``, others expose them through tool-completed events
+    or role=tool messages. Collect all three. Never trust the model's own prose
+    as evidence that a project URL exists.
     """
     aliases: dict[str, str] = {}
     tool_entries: list[tuple[str, Any]] = []
 
-    for tool in (getattr(run_output, "tools", None) or []):
-        name = getattr(tool, "tool_name", None) or getattr(tool, "name", None) or ""
-        if isinstance(tool, dict):
-            name = tool.get("tool_name") or tool.get("name") or name
-        lowered = str(name).casefold()
+    def add_entry(name: Any, payload: Any) -> None:
+        lowered = str(name or "").casefold()
+        if payload is None:
+            return
         if "modrinth" not in lowered and "curseforge" not in lowered:
-            continue
-        for field in ("result", "content", "output", "tool_result", "result_content"):
-            payload = getattr(tool, field, None)
-            if isinstance(tool, dict):
-                payload = tool.get(field, payload)
-            if payload is not None:
-                tool_entries.append((lowered, payload))
+            # If an Agno version omits the function name from a tool-result
+            # message, identify the source from the registered tool's structured
+            # result metadata. Do not infer from the assistant's own prose.
+            for node in _iter_mapping_nodes(payload):
+                source = str(node.get("source") or "").casefold()
+                if "modrinth" in source or "curseforge" in source:
+                    lowered = source
+                    break
+        if "modrinth" not in lowered and "curseforge" not in lowered:
+            return
+        tool_entries.append((lowered, payload))
 
-    # Some Agno versions expose tool completions through events instead of tools.
+    # Agno's aggregated tool execution records.
+    for tool in (getattr(run_output, "tools", None) or []):
+        lowered = _tool_source_name(tool)
+        for field in ("result", "content", "output", "tool_result", "result_content"):
+            payload = _read_value(tool, field)
+            if payload is not None:
+                add_entry(lowered, payload)
+
+    # Agno's streaming/completed event representations.
     for event in (getattr(run_output, "events", None) or []):
-        event_name = getattr(event, "event", None)
-        if isinstance(event, dict):
-            event_name = event.get("event", event_name)
-        if "toolcallcompleted" not in str(event_name or "").casefold():
+        event_name = str(_read_value(event, "event", "event_type") or "").casefold()
+        tool = _read_value(event, "tool")
+        lowered = _tool_source_name(tool) or _tool_source_name(event)
+        if "toolcallcompleted" not in event_name and "tool_call_completed" not in event_name:
             continue
-        tool = getattr(event, "tool", None)
-        if isinstance(event, dict):
-            tool = event.get("tool", tool)
-        name = getattr(tool, "tool_name", None) or getattr(tool, "name", None) or ""
-        if isinstance(tool, dict):
-            name = tool.get("tool_name") or tool.get("name") or name
-        lowered = str(name).casefold()
-        if "modrinth" not in lowered and "curseforge" not in lowered:
-            continue
-        payload = getattr(event, "content", None)
-        if isinstance(event, dict):
-            payload = event.get("content", payload)
+        payload = _read_value(event, "content", "result", "output")
         if payload is None and tool is not None:
-            payload = getattr(tool, "result", None) or (tool.get("result") if isinstance(tool, dict) else None)
-        if payload is not None:
-            tool_entries.append((lowered, payload))
+            payload = _read_value(tool, "result", "content", "output")
+        add_entry(lowered, payload)
+
+    # Important: some versions only retain the tool call and its result as
+    # separate messages, leaving RunOutput.tools empty. Tool messages are a
+    # trusted execution channel; the user's/assistant's ordinary prose is not.
+    for message in (getattr(run_output, "messages", None) or []):
+        role = str(_read_value(message, "role") or "").casefold()
+        if role not in {"tool", "function", "tool_result"}:
+            continue
+        lowered = _tool_source_name(message)
+        content = _read_value(message, "content", "result", "output")
+        add_entry(lowered, content)
 
     for tool_name, payload in tool_entries:
         for node in _iter_mapping_nodes(payload):
@@ -176,7 +212,6 @@ def collect_verified_project_links(run_output: Any) -> dict[str, str]:
             url = _clean_url_candidate(raw_url)
             if not url:
                 continue
-            # Accept URLs only from the corresponding registered search tool.
             host = (urlsplit(url).hostname or "").casefold()
             if "modrinth" in tool_name and not host.endswith("modrinth.com"):
                 continue

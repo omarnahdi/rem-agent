@@ -19,6 +19,7 @@ from .persona import SYSTEM_INSTRUCTIONS
 from .settings import Settings
 from .youtube_tools import YouTubeSearchTools
 from .engagement import ENGAGEMENT_INSTRUCTIONS
+from .schemas import EngagementDecision
 from .observability import langfuse_tool_hook
 
 logger = logging.getLogger(__name__)
@@ -150,7 +151,7 @@ def build_engagement_evaluator(settings: Settings) -> Agent:
             id=settings.groq_engagement_model,
             api_key=settings.groq_api_key,
             temperature=0,
-            request_params={"max_completion_tokens": 64},
+            request_params={"max_completion_tokens": 512},
         )
         logger.info("Conversation engagement evaluator enabled | provider=Groq | model=%s", settings.groq_engagement_model)
     else:
@@ -161,7 +162,7 @@ def build_engagement_evaluator(settings: Settings) -> Agent:
             id=settings.gemini_model,
             api_key=settings.gemini_api_key,
             temperature=0,
-            max_output_tokens=64,
+            max_output_tokens=256,
         )
         logger.info("Conversation engagement evaluator enabled | provider=Gemini | model=%s", settings.gemini_model)
 
@@ -170,6 +171,11 @@ def build_engagement_evaluator(settings: Settings) -> Agent:
         name="Rem Engagement Evaluator",
         model=model,
         instructions=ENGAGEMENT_INSTRUCTIONS,
+        # Use Agno's Pydantic schema + JSON mode instead of hoping Groq obeys
+        # a plain-text "JOIN or IGNORE" prompt. The caller handles validation
+        # errors and empty completions with a deterministic fallback.
+        output_schema=EngagementDecision,
+        use_json_mode=True,
         markdown=False,
         add_history_to_context=False,
         debug_mode=False,
