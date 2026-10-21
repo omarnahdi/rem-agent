@@ -8,12 +8,12 @@ import json
 import logging
 import re
 from typing import Optional
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 import discord
 from dotenv import load_dotenv
 
-from .commands import timeout_deadline_matches
+from .commands import apply_and_verify_timeout
 from .moderation_policy import must_block_conversation_agent
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,10 @@ MODERATION_MODEL = "gemini-3.5-flash-lite"
 # Groq is used ONLY as the moderation fallback when Gemini fails.
 # Free-tier fallback model selected by design: GPT-OSS 20B.
 GROQ_MODERATION_MODEL = "openai/gpt-oss-20b"
+
+# Automatic moderation timeout durations, in minutes.
+AUTO_TIMEOUT_GUEST_TO_MASTER_MINUTES = 10
+AUTO_TIMEOUT_SECOND_ABUSE_MINUTES = 20
 
 
 # ============================================================
@@ -874,10 +878,10 @@ async def moderate_message(
 
     Guest -> Guest:
         1st abuse = warning
-        2nd abuse = 1-minute timeout
+        2nd abuse = 20-minute timeout
 
     Guest -> Master:
-        genuine abuse = immediate 1-minute timeout
+        genuine abuse = immediate 10-minute timeout
 
     Target detection is NOT a prerequisite for classification anymore.
     """
@@ -1109,19 +1113,24 @@ async def moderate_message(
             return True
 
         try:
-            expected_until = datetime.now(timezone.utc) + timedelta(minutes=1)
-            await member.timeout(
-                timedelta(minutes=1),
+            timeout_result = await apply_and_verify_timeout(
+                message.guild,
+                member,
+                AUTO_TIMEOUT_GUEST_TO_MASTER_MINUTES * 60,
                 reason="Automatic protection of Master",
             )
-            verified_member = await message.guild.fetch_member(member.id)
-            until = getattr(verified_member, "communication_disabled_until", None)
-            if not timeout_deadline_matches(expected_until, until):
+            expected_until = timeout_result["expected_until"]
+            until = timeout_result["actual_until"]
+            if not timeout_result["verified"]:
                 logger.error(
                     "[AUTO-TIMEOUT UNVERIFIED] Discord did not confirm the "
-                    f"requested deadline for member_id={member.id}; expected="
-                    f"{expected_until.isoformat()} actual="
-                    f"{until.isoformat() if until else None}"
+                    "requested deadline | member_id=%s | expected=%s | actual=%s | "
+                    "attempts=%s | verification_error=%r",
+                    member.id,
+                    expected_until.isoformat(),
+                    until.isoformat() if until else None,
+                    timeout_result["attempts_used"],
+                    timeout_result["verification_error"],
                 )
                 await message.reply(
                     f"{member.mention}, please keep it respectful toward Master. 🌸 "
@@ -1130,21 +1139,20 @@ async def moderate_message(
                 return True
 
             logger.info(
-                "[AUTO-TIMEOUT SUCCESS] "
-                f"TargetAuthor={_member_identity(member)} | "
-                "Duration=1 minute | "
-                f"VerifiedUntil={until.isoformat()} | "
-                "Reason=Automatic protection of Master"
+                "[AUTO-TIMEOUT SUCCESS] TargetAuthor=%s | Duration=%s minutes | "
+                "VerifiedUntil=%s | Reason=Automatic protection of Master",
+                _member_identity(member),
+                AUTO_TIMEOUT_GUEST_TO_MASTER_MINUTES,
+                until.isoformat(),
             )
 
             await message.reply(
                 f"{member.mention}, that's enough. 🌸 "
-                f"I've verified your 1-minute timeout. "
-                f"Please keep it respectful toward Master."
+                f"I've verified your {AUTO_TIMEOUT_GUEST_TO_MASTER_MINUTES}-minute timeout. "
+                "Please keep it respectful toward Master."
             )
 
             return True
-
         except discord.Forbidden:
             logger.error(
                 "[AUTO-TIMEOUT ERROR] Discord permission denied."
@@ -1245,19 +1253,24 @@ async def moderate_message(
         return True
 
     try:
-        expected_until = datetime.now(timezone.utc) + timedelta(minutes=1)
-        await member.timeout(
-            timedelta(minutes=1),
+        timeout_result = await apply_and_verify_timeout(
+            message.guild,
+            member,
+            AUTO_TIMEOUT_SECOND_ABUSE_MINUTES * 60,
             reason="Second abusive message detected by Rem",
         )
-        verified_member = await message.guild.fetch_member(member.id)
-        until = getattr(verified_member, "communication_disabled_until", None)
-        if not timeout_deadline_matches(expected_until, until):
+        expected_until = timeout_result["expected_until"]
+        until = timeout_result["actual_until"]
+        if not timeout_result["verified"]:
             logger.error(
                 "[AUTO-TIMEOUT UNVERIFIED] Discord did not confirm the "
-                f"requested deadline for member_id={member.id}; expected="
-                f"{expected_until.isoformat()} actual="
-                f"{until.isoformat() if until else None}"
+                "requested deadline | member_id=%s | expected=%s | actual=%s | "
+                "attempts=%s | verification_error=%r",
+                member.id,
+                expected_until.isoformat(),
+                until.isoformat() if until else None,
+                timeout_result["attempts_used"],
+                timeout_result["verification_error"],
             )
             await message.reply(
                 f"{member.mention}, you've already been warned. 🌸 "
@@ -1266,14 +1279,16 @@ async def moderate_message(
             return True
 
         logger.info(
-            "[AUTO-TIMEOUT SUCCESS] "
-            f"TargetAuthor={_member_identity(member)} | "
-            f"Duration=1 minute | "
-            f"AbuseCount={abuse_count} | "
-            f"VerifiedUntil={until.isoformat()} | "
-            "Reason=Second abusive message detected by Rem"
+            "[AUTO-TIMEOUT SUCCESS] TargetAuthor=%s | Duration=%s minutes | "
+            "AbuseCount=%s | VerifiedUntil=%s | "
+            "Reason=Second abusive message detected by Rem",
+            _member_identity(member),
+            AUTO_TIMEOUT_SECOND_ABUSE_MINUTES,
+            abuse_count,
+            until.isoformat(),
         )
 
+        # Reset escalation only after Discord's stored deadline was verified.
         reset_abuse_count(
             guild_id,
             offender_id,
@@ -1282,18 +1297,18 @@ async def moderate_message(
         if action_target is not None:
             response = (
                 f"{member.mention}, you've already been warned. 🌸 "
-                f"I've timed you out for 1 minute. "
+                f"I've timed you out for {AUTO_TIMEOUT_SECOND_ABUSE_MINUTES} minutes. "
                 f"Please keep it respectful toward {action_target.mention}."
             )
         else:
             response = (
                 f"{member.mention}, you've already been warned. 🌸 "
-                f"I've timed you out for 1 minute. Please keep it respectful."
+                f"I've timed you out for {AUTO_TIMEOUT_SECOND_ABUSE_MINUTES} minutes. "
+                "Please keep it respectful."
             )
 
         await message.reply(response)
         return True
-
     except discord.Forbidden:
         logger.error(
             "[AUTO-TIMEOUT ERROR] Discord permission denied."

@@ -13,7 +13,7 @@ from agno.run import RunContext
 from agno.tools import Toolkit
 from agno.tools.discord import DiscordTools
 
-from .commands import timeout_deadline_matches
+from .commands import apply_and_verify_timeout, get_member_timeout_until
 from .context import history_query_score
 
 logger = logging.getLogger(__name__)
@@ -333,15 +333,31 @@ class RemDiscordActionTools(Toolkit):
                 return {"ok": False, "error": "Rem will not timeout another bot through this tool."}
             if member.top_role >= bot_member.top_role:
                 return {"ok": False, "error": "Target's highest role is equal to or above Rem's role."}
-            expected_until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
-            await member.timeout(timedelta(seconds=seconds), reason=(reason or "Requested through Rem")[:500])
-            # Read back Discord's state and verify the requested deadline rather than
-            # treating any pre-existing/active timeout as proof of success.
-            verified_member = await guild.fetch_member(member.id)
-            until = getattr(verified_member, "communication_disabled_until", None)
-            if not timeout_deadline_matches(expected_until, until):
-                return {"ok": False, "error": "Discord did not confirm the requested timeout deadline; no success is reported.", "expected_until": expected_until.isoformat(), "actual_until": until.isoformat() if until else None}
-            return {"ok": True, "action": "timeout_member", "member_id": str(member.id), "duration_seconds": seconds, "communication_disabled_until": until.isoformat(), "reason": reason}
+            timeout_result = await apply_and_verify_timeout(
+                guild,
+                member,
+                seconds,
+                reason=(reason or "Requested through Rem")[:500],
+            )
+            expected_until = timeout_result["expected_until"]
+            until = timeout_result["actual_until"]
+            if not timeout_result["verified"]:
+                return {
+                    "ok": False,
+                    "error": "Discord did not confirm the requested timeout deadline; no success is reported.",
+                    "expected_until": expected_until.isoformat(),
+                    "actual_until": until.isoformat() if until else None,
+                    "verification_attempts": timeout_result["attempts_used"],
+                    "verification_error": timeout_result["verification_error"],
+                }
+            return {
+                "ok": True,
+                "action": "timeout_member",
+                "member_id": str(member.id),
+                "duration_seconds": seconds,
+                "communication_disabled_until": until.isoformat(),
+                "reason": reason,
+            }
         except Exception as exc:
             logger.exception("timeout_member failed")
             return {"ok": False, "error": f"Timeout failed: {type(exc).__name__}: {exc}"}
@@ -369,11 +385,11 @@ class RemDiscordActionTools(Toolkit):
                 return {"ok": False, "error": "Rem will not modify another bot through this tool."}
             if member.top_role >= bot_member.top_role:
                 return {"ok": False, "error": "Target's highest role is equal to or above Rem's role."}
-            if getattr(member, "communication_disabled_until", None) is None:
+            if get_member_timeout_until(member) is None:
                 return {"ok": False, "error": "That member does not currently have an active timeout."}
             await member.timeout(None, reason=(reason or "Requested through Rem")[:500])
             verified_member = await guild.fetch_member(member.id)
-            if getattr(verified_member, "communication_disabled_until", None) is not None:
+            if get_member_timeout_until(verified_member) is not None:
                 return {"ok": False, "error": "Discord still reports an active timeout after the request."}
             return {"ok": True, "action": "remove_timeout", "member_id": str(member.id)}
         except Exception as exc:

@@ -21,7 +21,7 @@ load_dotenv()
 
 from .agent import build_agent, build_engagement_evaluator
 from .database import build_session_db
-from .commands import parse_timeout_command, timeout_deadline_matches
+from .commands import apply_and_verify_timeout, parse_timeout_command
 from .context import build_message_context, detect_pending_youtube_confirmation
 from .identity import identify_speaker, session_id_for
 from .engagement import ConversationEngagementGate, is_direct_rem_request
@@ -634,18 +634,45 @@ class RemAgnoDiscordClient(DiscordClient):
             if seconds <= 0 or seconds > 28 * 24 * 3600:
                 await message.reply("Please give me a timeout duration between 1 second and 28 days, Master. 🥺", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
                 return
-            # Write the requested deadline once (no remove-then-apply gap), then
-            # re-fetch authoritative state and verify the requested deadline.
-            expected_until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
-            await member.timeout(timedelta(seconds=seconds), reason="Manual timeout requested by Master via Rem")
-            verified_member = await guild.fetch_member(target_id)
-            until = getattr(verified_member, "communication_disabled_until", None)
-            if not timeout_deadline_matches(expected_until, until):
-                await message.reply("Discord didn't confirm the requested timeout deadline, Master, so I won't claim it succeeded. 🥺", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
-                logger.error("Timeout deadline mismatch | target_id=%s | expected=%s | actual=%s", target_id, expected_until.isoformat(), until.isoformat() if until else None)
+            # Apply an exact UTC deadline and verify the version-compatible
+            # member timeout property with brief retries for transient stale reads.
+            timeout_result = await apply_and_verify_timeout(
+                guild,
+                member,
+                seconds,
+                reason="Manual timeout requested by Master via Rem",
+            )
+            expected_until = timeout_result["expected_until"]
+            until = timeout_result["actual_until"]
+            if not timeout_result["verified"]:
+                await message.reply(
+                    "Discord didn't confirm the requested timeout deadline, Master, "
+                    "so I won't claim it succeeded. 🥺",
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                logger.error(
+                    "Timeout deadline mismatch | target_id=%s | expected=%s | actual=%s | "
+                    "attempts=%s | verification_error=%r",
+                    target_id,
+                    expected_until.isoformat(),
+                    until.isoformat() if until else None,
+                    timeout_result["attempts_used"],
+                    timeout_result["verification_error"],
+                )
                 return
-            logger.info("TIMEOUT SUCCESS | target_id=%s | seconds=%s | until=%s", target_id, seconds, until.isoformat())
-            await message.reply(f"Right away, Master. 🌸 {member.display_name} has been timed out for {request['amount']} {request['unit']}.", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+            logger.info(
+                "TIMEOUT SUCCESS | target_id=%s | seconds=%s | until=%s",
+                target_id,
+                seconds,
+                until.isoformat(),
+            )
+            await message.reply(
+                f"Right away, Master. 🌸 {member.display_name} has been timed out "
+                f"for {request['amount']} {request['unit']}.",
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
         except discord.Forbidden:
             logger.exception("Discord forbade timeout | target_id=%s", target_id)
             await message.reply("Discord refused the timeout, Master. Please check my permissions and role hierarchy. 🥺", mention_author=False, allowed_mentions=discord.AllowedMentions.none())
