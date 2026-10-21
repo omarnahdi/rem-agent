@@ -13,7 +13,7 @@ class PydanticStructuredOutputTests(unittest.TestCase):
         self.assertEqual(result.decision, "JOIN")
         self.assertTrue(_decision_value(result))
 
-    def test_engagement_decision_parses_json_mode_result(self):
+    def test_engagement_decision_parses_json_fallback_result(self):
         self.assertTrue(_decision_value('{"decision":"JOIN"}'))
         self.assertFalse(_decision_value('{"decision":"IGNORE"}'))
 

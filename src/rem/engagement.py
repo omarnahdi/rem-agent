@@ -212,7 +212,8 @@ def build_evaluator_input(history_context: str, recent_messages: list[Any]) -> s
         f"{history or '[No older history available]'}\n\n"
         "Newest observed messages (chronological):\n"
         f"{local_text or '[No recent messages available]'}\n\n"
-        "Output exactly JOIN or IGNORE."
+        'Return a JSON object matching the Pydantic schema: {"decision":"JOIN"} '
+        'or {"decision":"IGNORE"}. Do not return a bare token.'
     )
 
 

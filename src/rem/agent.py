@@ -141,41 +141,37 @@ def build_agent(settings: Settings, discord_client=None, *, vision_mode: bool = 
 
 
 def build_engagement_evaluator(settings: Settings) -> Agent:
-    """Build a small, stateless Agno agent that only returns JOIN or IGNORE.
+    """Build a stateless Gemini structured-output classifier for engagement.
 
-    It has no tools, no database, no conversation history, and debug logging is
-    always disabled so the evaluator's compact context is not dumped to logs.
+    Do not route this task through Groq GPT-OSS: it has repeatedly returned an
+    assistant message with no content in production. Gemini is selected explicitly
+    even when GROQ_API_KEY is configured. The Pydantic schema is sent through
+    Agno's native structured-output path; JSON-mode prompting is intentionally off.
     """
-    if settings.groq_api_key:
-        model = Groq(
-            id=settings.groq_engagement_model,
-            api_key=settings.groq_api_key,
-            temperature=0,
-            request_params={"max_completion_tokens": 512},
-        )
-        logger.info("Conversation engagement evaluator enabled | provider=Groq | model=%s", settings.groq_engagement_model)
-    else:
-        # Continue to support installations without a Groq key. The local
-        # pre-filter and evaluator minimum interval reduce calls; Gemini remains
-        # the fallback evaluator provider in that configuration.
-        model = Gemini(
-            id=settings.gemini_model,
-            api_key=settings.gemini_api_key,
-            temperature=0,
-            max_output_tokens=256,
-        )
-        logger.info("Conversation engagement evaluator enabled | provider=Gemini | model=%s", settings.gemini_model)
+    if not settings.gemini_api_key:
+        raise RuntimeError("Engagement evaluation requires GEMINI_API_KEY.")
+    if not settings.gemini_engagement_model:
+        raise RuntimeError("GEMINI_ENGAGEMENT_MODEL must not be empty.")
 
+    model = Gemini(
+        id=settings.gemini_engagement_model,
+        api_key=settings.gemini_api_key,
+        temperature=0,
+        max_output_tokens=512,
+    )
+    logger.info(
+        "Conversation engagement evaluator enabled | provider=Gemini | model=%s | schema=EngagementDecision",
+        settings.gemini_engagement_model,
+    )
     return Agent(
         id="rem-engagement-evaluator",
         name="Rem Engagement Evaluator",
         model=model,
         instructions=ENGAGEMENT_INSTRUCTIONS,
-        # Use Agno's Pydantic schema + JSON mode instead of hoping Groq obeys
-        # a plain-text "JOIN or IGNORE" prompt. The caller handles validation
-        # errors and empty completions with a deterministic fallback.
+        # Gemini supports native structured outputs with Pydantic schemas.
+        # Do not set use_json_mode=True: that is prompt-based JSON mode, not the
+        # provider's native constrained structured-output interface.
         output_schema=EngagementDecision,
-        use_json_mode=True,
         markdown=False,
         add_history_to_context=False,
         debug_mode=False,

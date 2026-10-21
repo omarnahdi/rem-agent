@@ -8,7 +8,13 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from .constants import DEFAULT_GEMINI_MODEL, DEFAULT_GROQ_REM_MODEL, DEFAULT_GROQ_VISION_MODEL, DEFAULT_MASTER_DISCORD_ID
+from .constants import (
+    DEFAULT_GEMINI_ENGAGEMENT_MODEL,
+    DEFAULT_GEMINI_MODEL,
+    DEFAULT_GROQ_REM_MODEL,
+    DEFAULT_GROQ_VISION_MODEL,
+    DEFAULT_MASTER_DISCORD_ID,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,7 +42,7 @@ class Settings:
     allowed_guild_channel_ids: frozenset[int]
     allow_all_guild_channels: bool
     engagement_enabled: bool
-    groq_engagement_model: str
+    gemini_engagement_model: str
     engagement_batch_window_ms: int
     engagement_min_eval_interval_seconds: int
     memory_batch_window_seconds: int
@@ -117,7 +123,9 @@ class Settings:
             allowed_guild_channel_ids=frozenset(parsed_channel_ids),
             allow_all_guild_channels=allow_all_guild_channels,
             engagement_enabled=engagement_enabled,
-            groq_engagement_model=os.getenv("GROQ_ENGAGEMENT_MODEL", "openai/gpt-oss-20b").strip(),
+            # Engagement classification always runs on Gemini structured output;
+            # Groq remains available only as a main-agent fallback.
+            gemini_engagement_model=os.getenv("GEMINI_ENGAGEMENT_MODEL", DEFAULT_GEMINI_ENGAGEMENT_MODEL).strip(),
             engagement_batch_window_ms=positive_int("REM_ENGAGEMENT_BATCH_WINDOW_MS", "1500", 250, 5000),
             engagement_min_eval_interval_seconds=positive_int("REM_ENGAGEMENT_MIN_EVAL_INTERVAL_SECONDS", "2", 0, 120),
         )
@@ -133,8 +141,8 @@ class Settings:
             raise RuntimeError("GROQ_REM_MODEL must not be empty.")
         if not self.groq_vision_model:
             raise RuntimeError("GROQ_VISION_MODEL must not be empty.")
-        if not self.groq_engagement_model:
-            raise RuntimeError("GROQ_ENGAGEMENT_MODEL must not be empty.")
+        if not self.gemini_engagement_model:
+            raise RuntimeError("GEMINI_ENGAGEMENT_MODEL must not be empty.")
 
     def sqlite_db_path(self) -> Path:
         path = Path(self.sqlite_session_db).expanduser()

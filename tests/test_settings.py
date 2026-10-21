@@ -83,15 +83,20 @@ class AgnoDebugSettingsTests(unittest.TestCase):
         self.assertEqual(settings.brave_api_key, "brave-test-key")
 
 
-    def test_engagement_is_enabled_by_default_with_low_cost_defaults(self):
+    def test_engagement_uses_gemini_structured_model_by_default(self):
         with patch.dict(os.environ, {}, clear=True):
             settings = Settings.from_env(load_env_file=False)
         self.assertTrue(settings.engagement_enabled)
-        self.assertEqual(settings.groq_engagement_model, "openai/gpt-oss-20b")
+        self.assertEqual(settings.gemini_engagement_model, "gemini-3.8-flash")
         self.assertEqual(settings.engagement_batch_window_ms, 1500)
         self.assertEqual(settings.engagement_min_eval_interval_seconds, 2)
         self.assertEqual(settings.memory_review_every, 10)
         self.assertEqual(settings.memory_batch_window_seconds, 8)
+
+
+    def test_engagement_model_can_be_overridden(self):
+        settings = self.load_settings(GEMINI_ENGAGEMENT_MODEL="gemini-3.6-flash")
+        self.assertEqual(settings.gemini_engagement_model, "gemini-3.6-flash")
 
     def test_engagement_can_be_disabled(self):
         with patch.dict(os.environ, {"REM_ENGAGEMENT_ENABLED": "false"}, clear=True):

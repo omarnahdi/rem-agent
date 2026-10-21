@@ -8,6 +8,7 @@ from rem.engagement import (
     ConversationEngagementGate,
     is_direct_rem_request,
     parse_engagement_decision,
+    build_evaluator_input,
     should_consider_spontaneous_reply,
 )
 
@@ -295,6 +296,12 @@ class EngagementGateTests(unittest.IsolatedAsyncioTestCase):
         from rem.engagement import ENGAGEMENT_INSTRUCTIONS
         self.assertIn("no fixed channel-wide reply cooldown", ENGAGEMENT_INSTRUCTIONS)
         self.assertIn("new topic", ENGAGEMENT_INSTRUCTIONS)
+
+    def test_evaluator_input_requests_structured_json_not_bare_token(self):
+        prompt = build_evaluator_input("", [FakeMessage(10, "Anyone know a mod?")])
+        self.assertIn('Return a JSON object matching the Pydantic schema', prompt)
+        self.assertIn('{"decision":"JOIN"}', prompt)
+        self.assertNotIn('Output exactly JOIN or IGNORE.', prompt)
 
 
 if __name__ == "__main__":
