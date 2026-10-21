@@ -39,9 +39,10 @@ def _is_master(metadata: dict[str, Any]) -> bool:
 
 
 class ScopedDiscordTools(DiscordTools):
-    """The official Agno Discord toolkit, with channel scope and Master checks added."""
+    """The official Agno Discord toolkit with active-server checks and action permissions."""
 
     def __init__(self, *, bot_token: str) -> None:
+        self._channel_guild_cache: dict[str, str] = {}
         super().__init__(
             bot_token=bot_token,
             # Register our async, RunContext-aware wrappers under the official
@@ -134,19 +135,38 @@ class ScopedDiscordTools(DiscordTools):
             return json.dumps({"ok": False, "action": action, "error": value.get("error") or value}, ensure_ascii=False)
         return json.dumps({"ok": True, "action": action, "result": value}, ensure_ascii=False)
 
-    @staticmethod
-    def _allowed_channel(channel_id: str, run_context: RunContext | None, *, destructive: bool = False) -> bool:
+    def _allowed_channel(self, channel_id: str, run_context: RunContext | None, *, destructive: bool = False) -> bool:
+        """Allow any bot-accessible channel in the active guild, not only the current channel.
+
+        Destructive operations stay Master-only. For ordinary reads, sends and channel
+        metadata, use Discord's channel endpoint to verify the requested channel belongs
+        to the same active server. This prevents both accidental single-channel scoping
+        and cross-server channel-ID use.
+        """
         meta = _context_metadata(run_context)
         if destructive and not _is_master(meta):
             return False
-        if _is_master(meta):
-            active_guild = meta.get("discord_guild_id")
-            requested_guild = meta.get("discord_tool_guild_id")
-            # A Master may use channel tools throughout the current server. The built-in REST API
-            # cannot resolve a channel's guild before this check, so explicit current-channel access
-            # is always permitted; cross-channel actions are restricted to Master by policy.
-            return True
-        return str(channel_id) in _scope_ids(meta)
+        active_guild = str(meta.get("discord_guild_id") or "").strip()
+        if not active_guild or active_guild.casefold() in {"dm", "none"}:
+            return str(channel_id) in _scope_ids(meta)
+        try:
+            normalized_id = str(int(channel_id))
+            cached_guild = self._channel_guild_cache.get(normalized_id)
+            if cached_guild is not None:
+                return cached_guild == active_guild
+            channel_data = self._make_request("GET", f"/channels/{normalized_id}")
+            target_guild = str(channel_data.get("guild_id") or "")
+            if target_guild:
+                self._channel_guild_cache[normalized_id] = target_guild
+            return target_guild == active_guild
+        except Exception:
+            logger.warning(
+                "Could not verify requested channel belongs to the active guild | channel_id=%s | guild_id=%s",
+                channel_id,
+                active_guild,
+                exc_info=True,
+            )
+            return False
 
     def send_message(self, channel_id: str, message: str, run_context: RunContext | None = None) -> str:
         """Send a message without allowing model-generated mass mentions.
@@ -156,7 +176,7 @@ class ScopedDiscordTools(DiscordTools):
             message: Text to send.
         """
         if not self._allowed_channel(channel_id, run_context):
-            return json.dumps({"ok": False, "action": "send_message", "error": "Guests may only send messages in the current channel or thread."})
+            return json.dumps({"ok": False, "action": "send_message", "error": "Requested channel is not accessible in the active server."})
         try:
             result = self._make_request(
                 "POST",
@@ -176,7 +196,7 @@ class ScopedDiscordTools(DiscordTools):
             limit: Number of recent messages to fetch (1-100).
         """
         if not self._allowed_channel(channel_id, run_context):
-            return json.dumps({"ok": False, "action": "get_channel_messages", "error": "Guests may only read history in the channel or thread where they are interacting with Rem."}, ensure_ascii=False)
+            return json.dumps({"ok": False, "action": "get_channel_messages", "error": "Requested channel is not accessible in the active server."}, ensure_ascii=False)
         result = super().get_channel_messages(channel_id=channel_id, limit=max(1, min(int(limit), 100)))
         return self._normalize_official_result("get_channel_messages", result)
 
@@ -187,7 +207,7 @@ class ScopedDiscordTools(DiscordTools):
             channel_id: Discord channel/thread ID.
         """
         if not self._allowed_channel(channel_id, run_context):
-            return json.dumps({"ok": False, "action": "get_channel_info", "error": "Guests may only inspect the channel or thread where they are interacting with Rem."}, ensure_ascii=False)
+            return json.dumps({"ok": False, "action": "get_channel_info", "error": "Requested channel is not accessible in the active server."}, ensure_ascii=False)
         result = super().get_channel_info(channel_id=channel_id)
         return self._normalize_official_result("get_channel_info", result)
 
@@ -197,8 +217,12 @@ class ScopedDiscordTools(DiscordTools):
         Args:
             guild_id: Discord server (guild) ID.
         """
-        if not _is_master(_context_metadata(run_context)):
+        meta = _context_metadata(run_context)
+        if not _is_master(meta):
             return json.dumps({"ok": False, "action": "list_channels", "error": "Listing all server channels is reserved for Master."}, ensure_ascii=False)
+        active_guild = str(meta.get("discord_guild_id") or "")
+        if not active_guild or active_guild.casefold() in {"dm", "none"} or str(guild_id) != active_guild:
+            return json.dumps({"ok": False, "action": "list_channels", "error": "Only the active Discord server can be listed."}, ensure_ascii=False)
         result = super().list_channels(guild_id=guild_id)
         return self._normalize_official_result("list_channels", result)
 
@@ -254,8 +278,16 @@ class RemDiscordActionTools(Toolkit):
             channel = await self.client.fetch_channel(channel_id)
         return channel
 
+    @staticmethod
+    def _channel_is_in_active_guild(channel: Any, channel_id: str, meta: dict[str, Any]) -> bool:
+        active_guild = str(meta.get("discord_guild_id") or "").strip()
+        if not active_guild or active_guild.casefold() in {"dm", "none"}:
+            return str(channel_id) in _scope_ids(meta)
+        target_guild = getattr(channel, "guild", None)
+        return target_guild is not None and str(getattr(target_guild, "id", "")) == active_guild
+
     async def add_reaction(self, channel_id: str, message_id: str, emoji: str, run_context: RunContext | None = None) -> dict[str, Any]:
-        """Add a reaction to a message in the current conversation scope.
+        """Add a reaction to a message in any channel accessible to Rem in the active server.
 
         Args:
             channel_id: Target Discord channel/thread ID.
@@ -263,10 +295,10 @@ class RemDiscordActionTools(Toolkit):
             emoji: Unicode emoji or an accessible custom emoji.
         """
         meta = self._meta(run_context)
-        if not _is_master(meta) and str(channel_id) not in _scope_ids(meta):
-            return {"ok": False, "error": "Guests may only react in the current channel/thread."}
         try:
             channel = await self._resolve_channel(int(channel_id))
+            if not self._channel_is_in_active_guild(channel, channel_id, meta):
+                return {"ok": False, "error": "Requested channel is not accessible in the active server."}
             message = await channel.fetch_message(int(message_id))
             parsed_emoji: Any = discord.PartialEmoji.from_str(emoji) if emoji.startswith(("<:", "<a:")) else emoji
             await message.add_reaction(parsed_emoji)
@@ -284,10 +316,10 @@ class RemDiscordActionTools(Toolkit):
             emoji: Unicode emoji or accessible custom emoji.
         """
         meta = self._meta(run_context)
-        if not _is_master(meta) and str(channel_id) not in _scope_ids(meta):
-            return {"ok": False, "error": "Guests may only manage reactions in the current channel/thread."}
         try:
             channel = await self._resolve_channel(int(channel_id))
+            if not self._channel_is_in_active_guild(channel, channel_id, meta):
+                return {"ok": False, "error": "Requested channel is not accessible in the active server."}
             message = await channel.fetch_message(int(message_id))
             if self.client.user is None:
                 return {"ok": False, "error": "Rem's Discord identity is not ready."}
@@ -397,11 +429,12 @@ class RemDiscordActionTools(Toolkit):
             return {"ok": False, "error": f"Timeout removal failed: {type(exc).__name__}: {exc}"}
 
     async def fetch_recent_conversation(self, query: str = "", limit: int = 20, run_context: RunContext | None = None) -> dict[str, Any]:
-        """Search previous messages in the current channel and related public threads.
+        """Search recent messages in the current conversation or across the active server.
 
-        A topic query scans a bounded window of parent-channel history, the current
-        thread, and a few recent sibling public threads. Private sibling threads are
-        deliberately excluded. Without a query, only recent context is fetched.
+        A topic query searches bot-accessible text channels and public threads across
+        the active server using bounded per-channel history. The current private thread
+        is included when applicable; unrelated guilds and inaccessible channels are excluded.
+        Without a query, only recent context is fetched.
 
         Args:
             query: Optional topic or keyword query. Leave empty to fetch recent context.
@@ -430,55 +463,60 @@ class RemDiscordActionTools(Toolkit):
             if has_query and source_channel_id is not None:
                 source_channel = candidate_channels.get(source_channel_id)
                 guild = getattr(source_channel, "guild", None)
-                sibling_threads: dict[int, Any] = {}
+                if guild is None and thread_id is not None:
+                    guild = getattr(candidate_channels.get(thread_id), "guild", None)
                 if guild is not None:
-                    # Cached threads are cheap. The active thread endpoint includes
-                    # public and private threads, so filter private threads and match
-                    # only this exact parent channel.
-                    for item in getattr(source_channel, "threads", []) or []:
-                        if getattr(item, "parent_id", None) == source_channel_id and not item.is_private():
-                            sibling_threads[item.id] = item
+                    # Topic searches are server-wide rather than confined to the
+                    # channel where the command was issued. Only channels visible to
+                    # the bot are returned by discord.py; Discord permissions remain
+                    # authoritative. Per-channel history remains bounded below.
+                    for text_channel in list(getattr(guild, "text_channels", []) or []):
+                        candidate_channels.setdefault(int(text_channel.id), text_channel)
+
+                    # Search active public threads across the server plus the thread
+                    # that is already the current conversation. Other private threads
+                    # remain excluded unless they are the current active thread.
+                    active_threads = list(getattr(guild, "threads", []) or [])
                     try:
-                        for item in await guild.active_threads():
-                            if getattr(item, "parent_id", None) == source_channel_id and not item.is_private():
-                                sibling_threads[item.id] = item
+                        active_threads.extend(await guild.active_threads())
                     except (discord.Forbidden, discord.HTTPException, AttributeError):
-                        logger.debug("Could not list active threads for channel %s", source_channel_id, exc_info=True)
+                        logger.debug("Could not list active guild threads", exc_info=True)
+                    for item in active_threads:
+                        if item.id in candidate_channels:
+                            continue
+                        try:
+                            is_private = bool(item.is_private())
+                        except (AttributeError, TypeError):
+                            is_private = False
+                        if not is_private:
+                            candidate_channels[int(item.id)] = item
+
+                    # Include a few recent archived public threads from the active
+                    # parent, but do not crawl every archive on every query.
                     archived_method = getattr(source_channel, "archived_threads", None)
                     if archived_method is not None:
                         try:
                             count = 0
                             async for item in archived_method(private=False, limit=25):
-                                if getattr(item, "parent_id", None) == source_channel_id:
-                                    sibling_threads[item.id] = item
-                                    count += 1
-                                    if count >= 25:
-                                        break
+                                candidate_channels.setdefault(int(item.id), item)
+                                count += 1
+                                if count >= 25:
+                                    break
                         except (discord.Forbidden, discord.HTTPException, AttributeError, TypeError):
                             logger.debug("Could not list archived public threads for channel %s", source_channel_id, exc_info=True)
 
-                # Current thread is already included. Limit sibling scans to a small
-                # recent set so one search cannot explode into thousands of messages.
-                sibling_candidates = [item for item in sibling_threads.values() if item.id not in candidate_channels]
-                sibling_candidates.sort(key=lambda item: item.id, reverse=True)
-                for item in sibling_candidates[:5]:
-                    candidate_channels[item.id] = item
-
             gathered_by_id: dict[str, dict[str, Any]] = {}
-            scope_ids = _scope_ids(meta)
             for channel_id, channel in candidate_channels.items():
-                is_current_scope = str(channel_id) in scope_ids
-                is_public_sibling = (
-                    has_query
-                    and source_channel_id is not None
-                    and getattr(channel, "parent_id", None) == source_channel_id
-                    and not (channel.is_private() if isinstance(channel, discord.Thread) else False)
-                )
-                if not user_is_master and not is_current_scope and not is_public_sibling:
+                # Search all candidate channels in the active guild, independent of
+                # which channel the current user happened to message Rem from.
+                channel_guild = getattr(channel, "guild", None)
+                if channel_guild is not None and str(getattr(channel_guild, "id", "")) != str(meta.get("discord_guild_id", "")):
+                    continue
+                if not has_query and channel_id not in {source_channel_id, thread_id}:
                     continue
 
                 # Scan a larger bounded history for explicit topic lookups, but use
-                # fewer messages from sibling threads to respect Discord rate limits.
+                # fewer messages from other channels/threads to respect Discord rate limits.
                 if has_query:
                     scan_limit = 500 if channel_id == source_channel_id or channel_id == thread_id else 100
                 else:
@@ -516,7 +554,7 @@ class RemDiscordActionTools(Toolkit):
                 "ok": True,
                 "query": query,
                 "scan_limits": {"main_channels": 500 if has_query else limit, "sibling_public_threads": 100 if has_query else 0, "sibling_thread_cap": 5},
-                "scope": "current conversation, parent channel, and up to five recent public sibling threads when a topic query is provided; private sibling threads are excluded",
+                "scope": "recent history in the active conversation by default; topic queries search bot-accessible text channels and active public threads across the current server, with bounded per-channel history; unrelated guilds are excluded",
                 "messages": gathered,
             }
         except Exception as exc:

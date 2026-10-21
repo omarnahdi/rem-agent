@@ -15,8 +15,8 @@ class SessionLockPool:
 
     @asynccontextmanager
     async def hold(self, session_id: str) -> AsyncIterator[None]:
-        # No await occurs while the registry is read/updated, so reference
-        # counting is atomic relative to other asyncio tasks on this event loop.
+        # Registry operations have no await, so reference counting is atomic on
+        # this event loop. Count both the current holder and queued waiters.
         entry = self._entries.get(session_id)
         if entry is None:
             entry = (asyncio.Lock(), 0)

@@ -23,12 +23,16 @@ EVALUATOR_RECENT_MESSAGES = 8
 EVALUATOR_HISTORY_CHAR_BUDGET = 2_600
 EVALUATOR_BUFFER_CHAR_BUDGET = 1_600
 
+# Treat common punctuation and greetings as direct addressing. These patterns
+# accept "Hey! Rem ...", "Rem??? find a mod", and "What's up, Rem!?".
 _DIRECT_NAME_REQUEST = re.compile(
-    r"^\s*(?:hey[\s,]+)?rem\b(?:\s*[,!:]\s*|\s*$)", re.IGNORECASE
+    r"^\s*(?:(?:hey|hi|yo)\b[\s,!:?.—-]*)?rem\b(?=$|[\s,:;!?.,—-])",
+    re.IGNORECASE,
 )
+_DIRECT_NAME_SUFFIX = re.compile(r"\brem[\s,:;!?.,—-]*$", re.IGNORECASE)
 _DIRECT_ACTION_AFTER_NAME = re.compile(
-    r"^\s*(?:hey[\s,]+)?rem\b[,:!]?\s+"
-    r"(?:can|could|would|will|please|help|find|search|look|tell|show|check|explain|remember|forget|update|timeout|mute|what|where|why|how|who)\b",
+    r"^\s*(?:(?:hey|hi|yo)\b[\s,!:?.—-]*)?rem\b[\s,!:?.;—-]*"
+    r"(?:can|could|would|will|please|help|give|find|search|look|tell|show|check|explain|remember|forget|update|timeout|mute|recommend|suggest|what|where|why|how|who)\b",
     re.IGNORECASE,
 )
 
@@ -69,10 +73,14 @@ def is_direct_rem_request(
     value = (content or "").strip()
     if not value:
         return False
-    # Starting with Rem's name is treated as a direct conversational address.
-    # The second pattern documents common forms explicitly and protects this
-    # behavior if the first regex is tightened later.
-    return bool(_DIRECT_NAME_REQUEST.match(value) or _DIRECT_ACTION_AFTER_NAME.match(value))
+    # Starting with Rem's name, or ending with Rem as a vocative, is treated as
+    # a direct address even when users repeat punctuation or use Hinglish/slang.
+    # This path must bypass the probabilistic spontaneous-engagement evaluator.
+    return bool(
+        _DIRECT_NAME_REQUEST.match(value)
+        or _DIRECT_NAME_SUFFIX.search(value)
+        or _DIRECT_ACTION_AFTER_NAME.match(value)
+    )
 
 
 def should_consider_spontaneous_reply(
@@ -205,12 +213,55 @@ def build_evaluator_input(history_context: str, recent_messages: list[Any]) -> s
     )
 
 
-def parse_engagement_decision(content: Any) -> bool:
-    """Accept only an unambiguous JOIN decision; all malformed outputs fail closed."""
+def _decision_value(content: Any) -> bool | None:
+    """Return JOIN/IGNORE as True/False, or None for malformed model output."""
     if not isinstance(content, str):
+        return None
+    normalized = content.strip().strip("`*_ .!\t\r\n").casefold() if content.strip() else ""
+    if normalized == "join":
+        return True
+    if normalized == "ignore":
         return False
-    normalized = content.strip().strip("`*_ .!\t\r\n") if content.strip() else ""
-    return normalized.casefold() == "join"
+    return None
+
+
+def parse_engagement_decision(content: Any) -> bool:
+    """Compatibility helper: accept only an unambiguous JOIN decision."""
+    return _decision_value(content) is True
+
+
+def _response_content(response: Any) -> Any:
+    """Read Agno's run content, falling back to its final assistant message."""
+    content = getattr(response, "content", None)
+    if isinstance(content, str) and content.strip():
+        return content
+    messages = getattr(response, "messages", None) or []
+    for message in reversed(messages):
+        role = getattr(message, "role", None)
+        value = getattr(message, "content", None)
+        if isinstance(message, dict):
+            role = message.get("role", role)
+            value = message.get("content", value)
+        if str(role).casefold() in {"assistant", "model"} and isinstance(value, str) and value.strip():
+            return value
+    return content
+
+
+def _fallback_engagement_decision(candidate: Any, recent_context: str = "") -> bool:
+    """Deterministic fallback when the evaluator returns empty/malformed output.
+
+    Explicitly addressed messages must not disappear just because the lightweight
+    model produced no content. For non-addressed messages, only join when Rem is
+    clearly being called on or the message explicitly points to her in a useful
+    question/request; otherwise remain quiet rather than spam a busy channel.
+    """
+    content = str(getattr(candidate, "content", "") or "").strip()
+    if is_direct_rem_request(content):
+        return True
+    has_rem = bool(re.search(r"\brem\b", content, re.IGNORECASE))
+    has_context_rem = bool(re.search(r"\brem\b", recent_context or "", re.IGNORECASE))
+    looks_actionable = bool(_QUESTION_OR_HELP_CUES.search(content) or _PROBLEM_CUES.search(content))
+    return looks_actionable and (has_rem or (has_context_rem and _INDIRECT_REM_REFERENCE.search(content) is not None))
 
 
 class ConversationEngagementGate:
@@ -325,12 +376,31 @@ class ConversationEngagementGate:
                     return
                 recent = sorted(self._recent.get(key, ()), key=_message_sort_key)
                 prompt = build_evaluator_input(history, recent)
+                evaluator_error: str | None = None
+                response_content: Any = None
                 try:
                     response = await self.evaluator.arun(input=prompt, add_history_to_context=False)
-                    decision = parse_engagement_decision(getattr(response, "content", None))
-                except Exception:
-                    logger.exception("Engagement evaluator failed; suppressing spontaneous reply | message_id=%s", getattr(candidate, "id", None))
-                    return
+                    response_content = _response_content(response)
+                except Exception as exc:
+                    evaluator_error = f"{type(exc).__name__}: {exc}"
+                    logger.exception(
+                        "Engagement evaluator call failed; using deterministic fallback | message_id=%s",
+                        getattr(candidate, "id", None),
+                    )
+
+                decision = _decision_value(response_content)
+                if decision is None:
+                    decision = _fallback_engagement_decision(candidate, history)
+                    logger.warning(
+                        "Engagement evaluator returned malformed/empty output; deterministic fallback=%s | "
+                        "message_id=%s | output_type=%s | output_preview=%r | error=%s",
+                        "JOIN" if decision else "IGNORE",
+                        getattr(candidate, "id", None),
+                        type(response_content).__name__,
+                        str(response_content)[:120] if response_content is not None else None,
+                        evaluator_error,
+                    )
+
                 if not decision:
                     logger.info("Engagement evaluator chose IGNORE | message_id=%s", getattr(candidate, "id", None))
                     return

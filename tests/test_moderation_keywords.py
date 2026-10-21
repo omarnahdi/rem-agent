@@ -31,6 +31,14 @@ class ModerationPolicyTests(unittest.TestCase):
         self.assertTrue(must_block_conversation_agent(None))
 
 
+class AutoTimeoutDurationTests(unittest.TestCase):
+    def test_master_protection_timeout_is_ten_minutes(self):
+        self.assertEqual(load_literal_assignment("AUTO_TIMEOUT_MASTER_MINUTES"), 10)
+
+    def test_second_general_abuse_penalty_is_twenty_minutes(self):
+        self.assertEqual(load_literal_assignment("AUTO_TIMEOUT_GENERAL_MINUTES"), 20)
+
+
 class LegacyModerationKeywordTests(unittest.TestCase):
     def test_legacy_master_aliases_are_preserved(self):
         aliases = set(load_literal_assignment("MASTER_TEXT_ALIASES"))

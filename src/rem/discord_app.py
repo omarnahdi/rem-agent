@@ -25,12 +25,11 @@ from .commands import apply_and_verify_timeout, parse_timeout_command
 from .context import build_message_context, detect_pending_youtube_confirmation
 from .identity import identify_speaker, session_id_for
 from .engagement import ConversationEngagementGate, is_direct_rem_request
-from .routing import should_accept_guild_channel
 from .moderation import moderate_message
 from .memory_service import RemMemoryService
 from .session_locks import SessionLockPool
 from .settings import Settings
-from .text_utils import looks_like_raw_tool_call_payload, normalize_modrinth_markdown_links
+from .text_utils import collect_verified_project_links, looks_like_raw_tool_call_payload, normalize_project_markdown_links
 from .observability import (
     configure_observability,
     install_asyncio_exception_handler,
@@ -128,24 +127,10 @@ class RemAgnoDiscordClient(DiscordClient):
             logger.info("Ignored non-Master DM | author_id=%s | message_id=%s", message.author.id, message.id)
             return
 
-        # Beta rollout is channel-scoped by default. For threads, the parent text
-        # channel can be allowlisted so replies inside a beta thread continue to work.
-        if message.guild is not None:
-            current_channel_id = int(getattr(message.channel, "id", 0) or 0)
-            parent_channel_id = getattr(message.channel, "parent_id", None)
-            if not should_accept_guild_channel(
-                channel_id=current_channel_id,
-                parent_channel_id=int(parent_channel_id) if parent_channel_id is not None else None,
-                allowed_channel_ids=self.settings.allowed_guild_channel_ids,
-                allow_all_channels=self.settings.allow_all_guild_channels,
-            ):
-                logger.debug(
-                    "Ignored guild message outside configured beta channels | guild_id=%s | channel_id=%s | parent_channel_id=%s",
-                    message.guild.id,
-                    current_channel_id,
-                    parent_channel_id,
-                )
-                return
+        # Every accessible guild text channel/thread is eligible. Channel allowlists
+        # were deliberately removed: Rem must not silently ignore messages because
+        # a channel ID was omitted from a beta allowlist. Discord permissions still
+        # determine which channels and actions the bot can actually access.
 
         # The old AI moderation runs on ordinary server messages, not only messages that address Rem.
         if message.guild is not None and not is_master and not _skip_moderation:
@@ -192,8 +177,13 @@ class RemAgnoDiscordClient(DiscordClient):
                 return
 
         is_reply_to_rem, referenced_message = await self._resolve_reply(message)
-        # Timeout actions stay explicit: the user must address Rem by mention or reply, and must be Master.
-        if is_master and message.guild is not None and (bot_user in message.mentions or is_reply_to_rem):
+        # Timeout actions stay explicit and Master-only. A clear textual address such
+        # as "Rem give @user a 6 minute timeout" is equivalent to a real @Rem mention;
+        # ordinary messages merely discussing Rem still fail the timeout parser.
+        explicitly_addressed_by_name = is_direct_rem_request(message.content or "")
+        if is_master and message.guild is not None and (
+            bot_user in message.mentions or is_reply_to_rem or explicitly_addressed_by_name
+        ):
             parsed_timeout = parse_timeout_command(
                 message,
                 author_id=message.author.id,
@@ -511,15 +501,23 @@ class RemAgnoDiscordClient(DiscordClient):
                         )
                         return
 
-                    # Repair malformed Modrinth Markdown URLs before Agno renders the
-                    # final response; the underlying tool URL and all other links stay intact.
+                    # Validate Modrinth/CurseForge links against the actual search-tool
+                    # results from this agent run. This repairs Markdown residue and
+                    # corrects a wrong destination when its displayed project title maps
+                    # to a returned result. Unknown project links become non-clickable text.
                     response_content = getattr(agent_response, "content", None)
                     if isinstance(response_content, str):
-                        normalized_content = normalize_modrinth_markdown_links(response_content)
+                        verified_project_links = collect_verified_project_links(agent_response)
+                        normalized_content = normalize_project_markdown_links(
+                            response_content,
+                            verified_links=verified_project_links,
+                        )
                         if normalized_content != response_content:
                             logger.warning(
-                                "Repaired malformed Modrinth Markdown link(s) | message_id=%s",
+                                "Normalized/validated Minecraft project links | message_id=%s | "
+                                "verified_project_aliases=%d",
                                 message.id,
+                                len(verified_project_links),
                             )
                             agent_response.content = normalized_content
 

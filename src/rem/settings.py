@@ -19,6 +19,7 @@ class Settings:
     gemini_model: str
     curseforge_api_key: str | None
     groq_api_key: str | None
+    brave_api_key: str | None
     groq_rem_model: str
     groq_vision_model: str
     database_url: str | None
@@ -39,8 +40,6 @@ class Settings:
     engagement_batch_window_ms: int
     engagement_min_eval_interval_seconds: int
     memory_batch_window_seconds: int
-    # Appended with a default to preserve existing direct Settings construction.
-    brave_api_key: str | None = None
 
     @classmethod
     def from_env(cls, *, load_env_file: bool = True) -> "Settings":
@@ -84,23 +83,10 @@ class Settings:
             raise ValueError("REM_ENGAGEMENT_ENABLED must be true/false, yes/no, on/off, or 1/0.")
         engagement_enabled = engagement_enabled_raw in {"1", "true", "yes", "on"}
 
-        raw_channel_ids = os.getenv("REM_ALLOWED_CHANNEL_IDS", "").strip()
-        allow_all_guild_channels = raw_channel_ids.casefold() == "all"
+        # Rem operates in every guild channel she can access. Ignore the legacy
+        # allowlist variable so stale .env entries cannot silently suppress replies.
+        allow_all_guild_channels = True
         parsed_channel_ids: set[int] = set()
-        if raw_channel_ids and not allow_all_guild_channels:
-            for raw_id in raw_channel_ids.split(","):
-                raw_id = raw_id.strip()
-                if not raw_id:
-                    continue
-                try:
-                    channel_id = int(raw_id)
-                except ValueError as exc:
-                    raise ValueError(
-                        "REM_ALLOWED_CHANNEL_IDS must be comma-separated numeric channel IDs, or 'all'."
-                    ) from exc
-                if channel_id <= 0:
-                    raise ValueError("REM_ALLOWED_CHANNEL_IDS entries must be positive numeric IDs.")
-                parsed_channel_ids.add(channel_id)
 
         return cls(
             # The prior bot used DISCORD_TOKEN; accept either name during migration.
@@ -109,8 +95,8 @@ class Settings:
             gemini_api_key=(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip() or None,
             gemini_model=os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip(),
             curseforge_api_key=os.getenv("CURSEFORGE_API_KEY", "").strip() or None,
-            brave_api_key=os.getenv("BRAVE_API_KEY", "").strip() or None,
             groq_api_key=os.getenv("GROQ_API_KEY", "").strip() or None,
+            brave_api_key=os.getenv("BRAVE_API_KEY", "").strip() or None,
             groq_rem_model=os.getenv("GROQ_REM_MODEL", DEFAULT_GROQ_REM_MODEL).strip(),
             groq_vision_model=os.getenv("GROQ_VISION_MODEL", DEFAULT_GROQ_VISION_MODEL).strip(),
             database_url=(os.getenv("AGNO_DATABASE_URL") or os.getenv("NEON_DATABASE_URL") or "").strip() or None,

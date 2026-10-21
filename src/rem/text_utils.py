@@ -1,10 +1,14 @@
-"""Pure text helpers, intentionally importable without Discord/Agno installed."""
-
+"""Pure text and project-link helpers, importable without Discord/Agno installed."""
 from __future__ import annotations
 
+import json
 import re
+from urllib.parse import urlsplit, urlunsplit
+from typing import Any
 
 DISCORD_MESSAGE_LIMIT = 1900
+_SUPPORTED_PROJECT_HOSTS = {"modrinth.com", "www.modrinth.com", "curseforge.com", "www.curseforge.com"}
+_SUPPORTED_MODRINTH_TYPES = {"mod", "modpack", "resourcepack", "datapack", "shader"}
 
 
 def split_discord_message(content: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:
@@ -35,13 +39,7 @@ def strip_bot_mention(content: str, bot_id: int) -> str:
 
 
 def looks_like_raw_tool_call_payload(content: str) -> bool:
-    """Identify common raw function/tool-call JSON accidentally exposed as chat.
-
-    This is a last-resort output guard, not a replacement for correctly registering
-    tools with Agno and allowing the framework to execute them.
-    """
-    import json
-
+    """Identify common raw function/tool-call JSON accidentally exposed as chat."""
     text = (content or "").strip()
     if not text or len(text) > 20_000:
         return False
@@ -53,70 +51,274 @@ def looks_like_raw_tool_call_payload(content: str) -> bool:
         return False
     if not isinstance(value, dict):
         return False
-    # Agno/tool-call JSON shape seen in the old bot's screenshot.
     if isinstance(value.get("name"), str) and isinstance(value.get("arguments"), (dict, list)):
         return True
-    if isinstance(value.get("function_call"), dict) or isinstance(value.get("tool_calls"), list):
-        return True
-    return False
+    return isinstance(value.get("function_call"), dict) or isinstance(value.get("tool_calls"), list)
 
 
-_MODRINTH_MARKDOWN_LINK_RE = re.compile(
-    r"\[(?P<label>[^\n]*?)\]"
-    r"\((?P<href>https?://(?:www\.)?modrinth\.com/mod/[^\s)]*)\)"
+def _clean_url_candidate(url: str) -> str:
+    """Remove Markdown residue/punctuation without changing a returned project path."""
+    value = (url or "").strip().strip("<>")
+    value = re.sub(r"(?:\\?[*_~`]+|[)\]}.,;!?]+)+$", "", value)
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return ""
+    host = (parts.hostname or "").casefold()
+    if host not in _SUPPORTED_PROJECT_HOSTS or parts.scheme not in {"http", "https"}:
+        return ""
+    path = re.sub(r"\\+$", "", parts.path).rstrip("/ ")
+    if not path:
+        return ""
+    # Strip query/fragment. Search tools return stable project pages, not tracking URLs.
+    return urlunsplit(("https", host, path, "", ""))
+
+
+def _project_slug(url: str) -> str:
+    cleaned = _clean_url_candidate(url)
+    if not cleaned:
+        return ""
+    parts = urlsplit(cleaned)
+    path_parts = [part for part in parts.path.split("/") if part]
+    if len(path_parts) < 2:
+        return ""
+    host = (parts.hostname or "").casefold()
+    if host.endswith("modrinth.com"):
+        if path_parts[0].casefold() not in _SUPPORTED_MODRINTH_TYPES:
+            return ""
+        return path_parts[1]
+    if host.endswith("curseforge.com") and len(path_parts) >= 3 and path_parts[0].casefold() == "minecraft":
+        return path_parts[-1]
+    return ""
+
+
+def _link_key(value: Any) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"[`*_~]", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.casefold().strip(" [](){}.,;:!?")
+
+
+def _iter_mapping_nodes(value: Any):
+    """Yield dictionaries nested inside tool results, decoding JSON strings when possible."""
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return
+        yield from _iter_mapping_nodes(decoded)
+        return
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            if isinstance(child, (dict, list, tuple, str)):
+                yield from _iter_mapping_nodes(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            yield from _iter_mapping_nodes(child)
+
+
+def collect_verified_project_links(run_output: Any) -> dict[str, str]:
+    """Build label/slug -> canonical URL mappings from actual Modrinth/CurseForge tool results.
+
+    Only successful project-search tool outputs are considered. The model's prose is
+    deliberately not treated as evidence of a valid URL.
+    """
+    aliases: dict[str, str] = {}
+    tool_entries: list[tuple[str, Any]] = []
+
+    for tool in (getattr(run_output, "tools", None) or []):
+        name = getattr(tool, "tool_name", None) or getattr(tool, "name", None) or ""
+        if isinstance(tool, dict):
+            name = tool.get("tool_name") or tool.get("name") or name
+        lowered = str(name).casefold()
+        if "modrinth" not in lowered and "curseforge" not in lowered:
+            continue
+        for field in ("result", "content", "output", "tool_result", "result_content"):
+            payload = getattr(tool, field, None)
+            if isinstance(tool, dict):
+                payload = tool.get(field, payload)
+            if payload is not None:
+                tool_entries.append((lowered, payload))
+
+    # Some Agno versions expose tool completions through events instead of tools.
+    for event in (getattr(run_output, "events", None) or []):
+        event_name = getattr(event, "event", None)
+        if isinstance(event, dict):
+            event_name = event.get("event", event_name)
+        if "toolcallcompleted" not in str(event_name or "").casefold():
+            continue
+        tool = getattr(event, "tool", None)
+        if isinstance(event, dict):
+            tool = event.get("tool", tool)
+        name = getattr(tool, "tool_name", None) or getattr(tool, "name", None) or ""
+        if isinstance(tool, dict):
+            name = tool.get("tool_name") or tool.get("name") or name
+        lowered = str(name).casefold()
+        if "modrinth" not in lowered and "curseforge" not in lowered:
+            continue
+        payload = getattr(event, "content", None)
+        if isinstance(event, dict):
+            payload = event.get("content", payload)
+        if payload is None and tool is not None:
+            payload = getattr(tool, "result", None) or (tool.get("result") if isinstance(tool, dict) else None)
+        if payload is not None:
+            tool_entries.append((lowered, payload))
+
+    for tool_name, payload in tool_entries:
+        for node in _iter_mapping_nodes(payload):
+            status = node.get("ok")
+            if status is False or str(status).casefold() == "false":
+                continue
+            raw_url = node.get("url") or node.get("website_url") or node.get("websiteUrl")
+            if not isinstance(raw_url, str):
+                continue
+            url = _clean_url_candidate(raw_url)
+            if not url:
+                continue
+            # Accept URLs only from the corresponding registered search tool.
+            host = (urlsplit(url).hostname or "").casefold()
+            if "modrinth" in tool_name and not host.endswith("modrinth.com"):
+                continue
+            if "curseforge" in tool_name and not host.endswith("curseforge.com"):
+                continue
+            title = node.get("title") or node.get("name") or node.get("project_name")
+            slug = node.get("slug") or _project_slug(url)
+            for alias in (title, slug, str(slug).replace("-", " ") if slug else None, raw_url, url):
+                key = _link_key(alias)
+                if key:
+                    aliases[key] = url
+    return aliases
+
+
+_PROJECT_MARKDOWN_LINK_RE = re.compile(
+    r"\[(?P<label>(?:[^\]\n]|\](?!\())*?)\]"
+    r"\((?P<href>https?://[^\s)]*)\)"
     r"(?P<tail>[^\s]*)",
     re.IGNORECASE,
 )
-_MODRINTH_PROJECT_PATH_RE = re.compile(
-    r"https?://(?:www\.)?modrinth\.com/mod/([a-z0-9_-]+)",
+_PROJECT_URL_IN_TEXT_RE = re.compile(
+    r"(?P<url>https?://(?:www\.)?(?:modrinth\.com|curseforge\.com)/[^\s<>()\[\]\\*_~`]+)"
+    # Capture common stray Markdown residues after a bare URL so they can be
+    # removed instead of becoming part of Discord's clickable URL target.
+    r"(?P<tail>(?:\)\*{1,2}|[*_~`]+)*)",
+    re.IGNORECASE,
+)
+_MODRINTH_PATH_RE = re.compile(
+    r"https?://(?:www\.)?modrinth\.com/(?P<kind>mod|modpack|resourcepack|datapack|shader)/(?P<slug>[a-z0-9_-]+)",
     re.IGNORECASE,
 )
 
 
-def normalize_modrinth_markdown_links(content: str) -> str:
-    """Repair malformed Markdown links to Modrinth project pages.
+def normalize_project_markdown_links(content: str, verified_links: dict[str, str] | None = None) -> str:
+    """Repair malformed project links and prefer exact URLs returned by search tools.
 
-    LLMs occasionally leak closing parentheses or formatting markers into a
-    project URL, for example ``[https://modrinth.com/mod/foo)\\*\\*]`` or
-    ``](https://modrinth.com/mod/foo\\)**)``. Discord then embeds a URL that
-    does not exist. This guard rebuilds only links whose project URL or URL
-    label is malformed; unrelated Markdown and ordinary links are unchanged.
+    If successful Modrinth/CurseForge search results are present, project links that
+    cannot be matched to those results are rendered as plain labels instead of sending
+    users to an unverified or unrelated destination. Other hyperlinks are untouched.
     """
     if not isinstance(content, str) or not content:
         return content or ""
+    catalog = {key: value for key, value in (verified_links or {}).items() if _clean_url_candidate(value)}
+    # A provided catalog means the caller has the current run's tool results, so
+    # enforce that links resolve to those results. None means a legacy caller with
+    # no catalog: repair formatting only and preserve valid URLs for compatibility.
+    strict = verified_links is not None
+
+    def resolve(label: str, href: str) -> str | None:
+        for value in (label, href, _project_slug(href), _project_slug(label)):
+            key = _link_key(value)
+            if key and key in catalog:
+                return catalog[key]
+        # Without search evidence, repair Markdown contamination while retaining the
+        # slug the model supplied; this fixes syntax, but does not claim validation.
+        if not strict:
+            clean_href = _clean_url_candidate(href)
+            if clean_href:
+                if (urlsplit(clean_href).hostname or "").casefold().endswith("modrinth.com"):
+                    match = _MODRINTH_PATH_RE.match(clean_href)
+                    if match:
+                        return f"https://modrinth.com/{match.group('kind').casefold()}/{match.group('slug')}"
+                return clean_href
+        return None
 
     def repair(match: re.Match[str]) -> str:
-        label = match.group("label")
-        href = match.group("href")
-        tail = match.group("tail")
-        project_match = _MODRINTH_PROJECT_PATH_RE.search(href)
-        if not project_match:
+        label = match.group("label").strip()
+        href = match.group("href").strip()
+        tail = match.group("tail") or ""
+        host = ""
+        try:
+            host = (urlsplit(_clean_url_candidate(href)).hostname or "").casefold()
+        except ValueError:
+            pass
+        is_supported = host.endswith("modrinth.com") or host.endswith("curseforge.com")
+        if not is_supported and not any(hostname in href.casefold() for hostname in ("modrinth.com", "curseforge.com")):
             return match.group(0)
 
-        canonical_url = f"https://modrinth.com/mod/{project_match.group(1)}"
-        label_url_match = _MODRINTH_PROJECT_PATH_RE.search(label)
-        label_is_url = label_url_match is not None
-        label_is_canonical_url = label.strip() == canonical_url
-        href_is_canonical = href.rstrip("/") == canonical_url
-
-        # A suffix immediately following a Markdown link can be legitimate
-        # prose punctuation. We only repair the link when its href or URL label
-        # is already malformed, then drop the formatting residue attached to it.
-        malformed = (
-            not href_is_canonical
-            or (label_is_url and not label_is_canonical_url)
-        )
-        if not malformed:
+        resolved = resolve(label, href)
+        label_as_url = bool(_project_slug(label))
+        prefix = content[:match.start()]
+        cleaned_tail = re.sub(r"^(?:(?:\\?[*_~`]+)|[)\]]+)+", "", tail)
+        # Preserve balanced emphasis that genuinely wraps the link, e.g.
+        # **[Sodium](https://modrinth.com/mod/sodium)**. Do not preserve an
+        # unmatched trailing ** after a complete sentence/link: that is the
+        # malformed suffix seen in Discord's "Leaving Discord" URL preview.
+        if tail and any(tail == marker and prefix.endswith(marker) for marker in ("**", "__", "~~", "*", "_", "`")):
+            cleaned_tail = tail
+        if resolved is None:
+            # A search succeeded but the model returned an unknown project link.
+            # Keep the human-readable name and discard the bad target.
+            return (label if not label_as_url else "unverified project link") + cleaned_tail
+        if label_as_url:
+            label = resolved
+        # Return the original only when both the canonical target and Markdown
+        # suffix are already clean. In particular, don't bypass suffix repair
+        # just because the URL itself matches the search result.
+        if resolved == _clean_url_candidate(href) and href.rstrip("/") == resolved and cleaned_tail == tail:
             return match.group(0)
+        return f"[{label}]({resolved}){cleaned_tail}"
 
-        clean_label = canonical_url if label_is_url else label
-        # Remove only common stray closing Markdown markers (e.g. **)) while
-        # retaining ordinary punctuation such as a following period or comma.
-        clean_tail = re.sub(
-            r"^(?:(?:\\?[*_~`]+)|[)\]]+)+",
-            "",
-            tail,
-        )
-        return f"[{clean_label}]({canonical_url}){clean_tail}"
+    normalized = _PROJECT_MARKDOWN_LINK_RE.sub(repair, content)
 
-    return _MODRINTH_MARKDOWN_LINK_RE.sub(repair, content)
+    # If the model emitted a plain malformed supported-platform URL, clean only the
+    # markdown residue. Avoid changing links to unrelated platforms.
+    def clean_plain(match: re.Match[str]) -> str:
+        # Markdown destinations have already been handled above. Do not process
+        # their inner URL a second time: its closing `)` belongs to the Markdown
+        # link and must not be mistaken for stray punctuation.
+        prefix = normalized[:match.start()]
+        if prefix.rfind("](") == prefix.rfind("]") and prefix.rfind("](") >= 0:
+            return match.group(0)
+        raw = match.group("url")
+        tail = match.group("tail") or ""
+        cleaned = _clean_url_candidate(raw)
+        if not cleaned:
+            return match.group(0)
+        verified = catalog.get(_link_key(cleaned)) or catalog.get(_link_key(_project_slug(cleaned)))
+        # A plain URL can be emphasized intentionally. Keep the closing emphasis
+        # only when its opener is immediately before the URL; strip orphaned
+        # Markdown suffixes such as `)**` from the actual destination.
+        clean_tail = tail
+        if tail.startswith(")**"):
+            clean_tail = tail[3:]
+        elif tail and any(tail == marker and prefix.endswith(marker) for marker in ("**", "__", "~~", "*", "_", "`")):
+            clean_tail = tail
+        else:
+            clean_tail = re.sub(r"^(?:[*_~`]+)+", "", tail)
+        if not verified:
+            if not strict:
+                # Legacy/format-only mode: keep a valid URL, but strip malformed
+                # suffixes so Discord does not include Markdown residue in its URL.
+                return cleaned + clean_tail
+            host = (urlsplit(cleaned).hostname or "").casefold()
+            platform = "Modrinth" if host.endswith("modrinth.com") else "CurseForge"
+            return f"[unverified {platform} project link]{clean_tail}"
+        return verified + clean_tail
+
+    normalized = _PROJECT_URL_IN_TEXT_RE.sub(clean_plain, normalized)
+    return normalized
+
+
+def normalize_modrinth_markdown_links(content: str) -> str:
+    """Backward-compatible helper for legacy callers/tests."""
+    return normalize_project_markdown_links(content)

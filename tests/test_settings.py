@@ -11,27 +11,24 @@ class AllowedChannelSettingsTests(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             return Settings.from_env(load_env_file=False)
 
-    def test_empty_allowlist_fails_closed(self):
+    def test_empty_allowlist_does_not_block_guild_channels(self):
         settings = self.load_settings("")
         self.assertEqual(settings.allowed_guild_channel_ids, frozenset())
-        self.assertFalse(settings.allow_all_guild_channels)
+        self.assertTrue(settings.allow_all_guild_channels)
 
-    def test_comma_separated_channel_ids_are_parsed(self):
+    def test_legacy_channel_ids_are_ignored(self):
         settings = self.load_settings("123456789, 987654321")
-        self.assertEqual(
-            settings.allowed_guild_channel_ids,
-            frozenset({123456789, 987654321}),
-        )
-        self.assertFalse(settings.allow_all_guild_channels)
+        self.assertEqual(settings.allowed_guild_channel_ids, frozenset())
+        self.assertTrue(settings.allow_all_guild_channels)
 
-    def test_all_channels_requires_explicit_literal(self):
+    def test_all_channels_are_enabled_by_default(self):
         settings = self.load_settings("all")
         self.assertTrue(settings.allow_all_guild_channels)
         self.assertEqual(settings.allowed_guild_channel_ids, frozenset())
 
-    def test_invalid_channel_id_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "REM_ALLOWED_CHANNEL_IDS"):
-            self.load_settings("123,not-a-channel")
+    def test_malformed_legacy_channel_allowlist_is_ignored(self):
+        settings = self.load_settings("123,not-a-channel")
+        self.assertTrue(settings.allow_all_guild_channels)
 
 
 class AgnoDebugSettingsTests(unittest.TestCase):

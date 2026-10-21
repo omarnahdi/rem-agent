@@ -5,18 +5,14 @@
 import asyncio
 import os
 import json
-import logging
 import re
 from typing import Optional
-from datetime import timedelta
 
 import discord
 from dotenv import load_dotenv
 
 from .commands import apply_and_verify_timeout
 from .moderation_policy import must_block_conversation_agent
-
-logger = logging.getLogger(__name__)
 
 # Load the same .env before reading GROQ_API_KEY, independent of import order.
 load_dotenv()
@@ -33,9 +29,10 @@ MODERATION_MODEL = "gemini-3.5-flash-lite"
 # Free-tier fallback model selected by design: GPT-OSS 20B.
 GROQ_MODERATION_MODEL = "openai/gpt-oss-20b"
 
-# Automatic moderation timeout durations, in minutes.
-AUTO_TIMEOUT_GUEST_TO_MASTER_MINUTES = 10
-AUTO_TIMEOUT_SECOND_ABUSE_MINUTES = 20
+# AutoMod penalties requested by Master. Keep these centralized so the first
+# escalation and the immediate Master-protection penalty cannot drift apart.
+AUTO_TIMEOUT_MASTER_MINUTES = 10
+AUTO_TIMEOUT_GENERAL_MINUTES = 20
 
 
 # ============================================================
@@ -109,7 +106,7 @@ MASTER_FAST_ABUSE_PATTERNS = (
     r"(?:master|omar|omar\s+nahdi|umar|umar\s+nahdi|nalla|nallaa|berojgaar|berojgar|nightx|nightxwolf|nightx\s+wolf)\b",
 )
 
-logger.debug(f"[MODERATION MODULE] Loaded from: {__file__}")
+print(f"[MODERATION MODULE] Loaded from: {__file__}")
 
 
 # ============================================================
@@ -298,14 +295,14 @@ async def build_moderation_context(
         discord.Forbidden,
         discord.HTTPException,
     ) as e:
-        logger.error(
+        print(
             f"[MODERATION CONTEXT] History fetch failed: {type(e).__name__}: {e}"
         )
         return []
 
     messages.reverse()
 
-    logger.debug(
+    print(
         f"[MODERATION CONTEXT] Loaded {len(messages)} "
         f"recent message(s) for message {message.id}."
     )
@@ -416,7 +413,7 @@ async def _direct_target_member(
         return candidates[0]
 
     if len(candidates) > 1:
-        logger.debug(
+        print(
             "[MODERATION TARGET TEXT] Ambiguous current-message target -> "
             + ", ".join(member.display_name for member in candidates[:8])
         )
@@ -459,7 +456,7 @@ async def get_target_member(
         )
 
         if contextual_target is not None:
-            logger.debug(
+            print(
                 "[MODERATION TARGET CONTEXT] "
                 f"Inherited from message {previous.id} -> "
                 f"{_member_identity(contextual_target)}"
@@ -503,7 +500,7 @@ async def infer_contextual_target_after_abuse(
             continue
 
         if author.id == master_id:
-            logger.debug(
+            print(
                 "[MODERATION TARGET CONTEXT] "
                 "ABUSE message follows Master's message -> "
                 f"{_member_identity(author)}"
@@ -514,7 +511,7 @@ async def infer_contextual_target_after_abuse(
         # from the guild cache to keep the target identity stable.
         member = message.guild.get_member(author.id)
         if member is not None and not member.bot:
-            logger.debug(
+            print(
                 "[MODERATION TARGET CONTEXT] "
                 "ABUSE message follows another human's message -> "
                 f"{_member_identity(member)}"
@@ -644,7 +641,7 @@ async def _groq_moderation_fallback(
     """
 
     if groq is None:
-        logger.error(
+        print(
             "[MODERATION GROQ] "
             "Fallback unavailable. "
             "Set GROQ_API_KEY and install the groq package."
@@ -665,7 +662,7 @@ FALLBACK EXECUTION RULES:
 """
 
     try:
-        logger.warning(
+        print(
             f"[MODERATION GROQ] "
             f"Gemini unavailable. Trying {GROQ_MODERATION_MODEL}..."
         )
@@ -701,7 +698,7 @@ FALLBACK EXECUTION RULES:
         if result["classification"] == "UNAVAILABLE":
             raise ValueError("Groq returned an invalid moderation classification.")
 
-        logger.info(
+        print(
             "[MODERATION GROQ] "
             f"{GROQ_MODERATION_MODEL} responded successfully."
         )
@@ -709,7 +706,7 @@ FALLBACK EXECUTION RULES:
         return result
 
     except Exception as e:
-        logger.error(
+        print(
             "[MODERATION GROQ] "
             f"Fallback error: {e}"
         )
@@ -842,14 +839,14 @@ Do not include additional fields.
         return result
 
     except Exception as e:
-        logger.error(
+        print(
             f"[MODERATION AI] Gemini classifier error: {type(e).__name__}: {e}"
         )
 
         try:
             return await _groq_moderation_fallback(prompt)
         except Exception as fallback_error:
-            logger.error(
+            print(
                 "[MODERATION AI] "
                 f"All classifier paths failed: {type(fallback_error).__name__}: "
                 f"{fallback_error}"
@@ -902,14 +899,14 @@ async def moderate_message(
 
     author = message.author
 
-    logger.info(
+    print(
         "[MODERATION CHECK] "
         f"Author={author.display_name} | "
         f"Username=@{author.name} | "
         f"Mention={author.mention} | "
         f"UserID={author.id} | "
         f"MessageID={message.id} | "
-        f"ContentLength={len(message.content or '')}"
+        f"Content={message.content!r}"
     )
 
     # --------------------------------------------------------
@@ -919,7 +916,7 @@ async def moderate_message(
     recent_messages = await build_moderation_context(message)
     moderation_context = format_moderation_context(recent_messages)
 
-    logger.debug(
+    print(
         f"[MODERATION CONTEXT] chars={len(moderation_context)} | "
         f"messages={len(recent_messages)}"
     )
@@ -937,20 +934,20 @@ async def moderate_message(
 
     if target is not None:
         if target.bot:
-            logger.debug(
+            print(
                 "[MODERATION TARGET] Bot target detected -> no punitive target action."
             )
         elif target.id == author.id:
-            logger.debug(
+            print(
                 "[MODERATION TARGET] Self-directed message -> no punitive target action."
             )
         else:
-            logger.debug(
+            print(
                 "[MODERATION TARGET] "
                 f"{_member_identity(target)}"
             )
     else:
-        logger.debug(
+        print(
             "[MODERATION TARGET] Unresolved; message will STILL be classified."
         )
 
@@ -974,7 +971,7 @@ async def moderate_message(
 
     if fast_result is not None:
         result = fast_result
-        logger.info(
+        print(
             "[MODERATION FAST] "
             f"Classification={result['classification']} | "
             f"Confidence={result['confidence']:.2f} | "
@@ -1002,7 +999,7 @@ async def moderate_message(
         # fail closed: the caller must not pass an unmoderated message to Rem's
         # conversational agent. Returning True means the message was handled
         # by this policy gate, not that a punitive action was taken.
-        logger.warning(
+        print(
             "[MODERATION RESULT] UNAVAILABLE -> fail closed; no punishment or "
             "counter update, and the message will not enter the conversation agent."
         )
@@ -1022,7 +1019,7 @@ async def moderate_message(
 
         if contextual_target is not None and contextual_target.id != author.id:
             action_target = contextual_target
-            logger.debug(
+            print(
                 "[MODERATION TARGET CONTEXT] "
                 "Resolved target after ABUSE classification: "
                 f"{_member_identity(action_target)}"
@@ -1034,7 +1031,7 @@ async def moderate_message(
         else "UNRESOLVED"
     )
 
-    logger.info(
+    print(
         "[MODERATION AI] "
         f"Author={author.display_name} | "
         f"AuthorID={author.id} | "
@@ -1049,7 +1046,7 @@ async def moderate_message(
     # --------------------------------------------------------
 
     if classification == "SAFE":
-        logger.info("[MODERATION RESULT] SAFE -> no action.")
+        print("[MODERATION RESULT] SAFE -> no action.")
         return False
 
     # --------------------------------------------------------
@@ -1057,7 +1054,7 @@ async def moderate_message(
     # --------------------------------------------------------
 
     if classification == "MILD_INSULT":
-        logger.info("[MODERATION RESULT] MILD_INSULT -> no punitive action.")
+        print("[MODERATION RESULT] MILD_INSULT -> no punitive action.")
         return False
 
     # --------------------------------------------------------
@@ -1065,7 +1062,7 @@ async def moderate_message(
     # --------------------------------------------------------
 
     if classification != "ABUSE":
-        logger.warning(
+        print(
             f"[MODERATION RESULT] Unknown classification={classification!r} -> no action."
         )
         return False
@@ -1075,7 +1072,7 @@ async def moderate_message(
     # --------------------------------------------------------
 
     if confidence < 0.70:
-        logger.warning(
+        print(
             "[MODERATION RESULT] ABUSE confidence below 0.70 -> no action."
         )
         return False
@@ -1089,11 +1086,11 @@ async def moderate_message(
         me = message.guild.me
 
         if me is None:
-            logger.warning("[AUTO-TIMEOUT] Guild member cache returned no bot member.")
+            print("[AUTO-TIMEOUT] Guild member cache returned no bot member.")
             return False
 
         if not me.guild_permissions.moderate_members:
-            logger.warning(
+            print(
                 "[AUTO-TIMEOUT] Rem lacks Timeout Members permission."
             )
 
@@ -1103,7 +1100,7 @@ async def moderate_message(
             return True
 
         if member.top_role >= me.top_role:
-            logger.warning(
+            print(
                 "[AUTO-TIMEOUT] Target role is too high."
             )
 
@@ -1116,21 +1113,19 @@ async def moderate_message(
             timeout_result = await apply_and_verify_timeout(
                 message.guild,
                 member,
-                AUTO_TIMEOUT_GUEST_TO_MASTER_MINUTES * 60,
+                AUTO_TIMEOUT_MASTER_MINUTES * 60,
                 reason="Automatic protection of Master",
             )
             expected_until = timeout_result["expected_until"]
             until = timeout_result["actual_until"]
             if not timeout_result["verified"]:
-                logger.error(
+                print(
                     "[AUTO-TIMEOUT UNVERIFIED] Discord did not confirm the "
-                    "requested deadline | member_id=%s | expected=%s | actual=%s | "
-                    "attempts=%s | verification_error=%r",
-                    member.id,
-                    expected_until.isoformat(),
-                    until.isoformat() if until else None,
-                    timeout_result["attempts_used"],
-                    timeout_result["verification_error"],
+                    f"requested deadline for member_id={member.id}; "
+                    f"expected={expected_until.isoformat()} "
+                    f"actual={until.isoformat() if until else None} "
+                    f"attempts={timeout_result['attempts_used']} "
+                    f"verification_error={timeout_result['verification_error']!r}"
                 )
                 await message.reply(
                     f"{member.mention}, please keep it respectful toward Master. 🌸 "
@@ -1138,23 +1133,22 @@ async def moderate_message(
                 )
                 return True
 
-            logger.info(
-                "[AUTO-TIMEOUT SUCCESS] TargetAuthor=%s | Duration=%s minutes | "
-                "VerifiedUntil=%s | Reason=Automatic protection of Master",
-                _member_identity(member),
-                AUTO_TIMEOUT_GUEST_TO_MASTER_MINUTES,
-                until.isoformat(),
+            print(
+                "[AUTO-TIMEOUT SUCCESS] "
+                f"TargetAuthor={_member_identity(member)} | "
+                f"Duration={AUTO_TIMEOUT_MASTER_MINUTES} minutes | "
+                f"VerifiedUntil={until.isoformat()} | "
+                "Reason=Automatic protection of Master"
             )
-
             await message.reply(
                 f"{member.mention}, that's enough. 🌸 "
-                f"I've verified your {AUTO_TIMEOUT_GUEST_TO_MASTER_MINUTES}-minute timeout. "
+                f"I've verified your {AUTO_TIMEOUT_MASTER_MINUTES}-minute timeout. "
                 "Please keep it respectful toward Master."
             )
-
             return True
+
         except discord.Forbidden:
-            logger.error(
+            print(
                 "[AUTO-TIMEOUT ERROR] Discord permission denied."
             )
 
@@ -1164,13 +1158,13 @@ async def moderate_message(
             return True
 
         except discord.HTTPException as e:
-            logger.error(
+            print(
                 f"[AUTO-TIMEOUT ERROR] Discord HTTP error: {type(e).__name__}: {e}"
             )
             return False
 
         except Exception as e:
-            logger.error(
+            print(
                 f"[AUTO-TIMEOUT ERROR] Unexpected error: {type(e).__name__}: {e}"
             )
             return False
@@ -1187,7 +1181,7 @@ async def moderate_message(
         offender_id,
     )
 
-    logger.info(
+    print(
         "[MODERATION COUNT] "
         f"Author={author.display_name} | "
         f"AuthorID={author.id} | "
@@ -1214,7 +1208,7 @@ async def moderate_message(
 
         await message.reply(response)
 
-        logger.warning(
+        print(
             "[MODERATION WARNING] "
             f"Author={author.display_name} | Count=1"
         )
@@ -1229,11 +1223,11 @@ async def moderate_message(
     me = message.guild.me
 
     if me is None:
-        logger.error("[AUTO-TIMEOUT ERROR] Guild member cache returned no bot member.")
+        print("[AUTO-TIMEOUT ERROR] Guild member cache returned no bot member.")
         return False
 
     if not me.guild_permissions.moderate_members:
-        logger.warning(
+        print(
             "[AUTO-TIMEOUT] Rem lacks Timeout Members permission."
         )
 
@@ -1243,7 +1237,7 @@ async def moderate_message(
         return True
 
     if member.top_role >= me.top_role:
-        logger.warning(
+        print(
             "[AUTO-TIMEOUT] Offender role is too high."
         )
 
@@ -1256,21 +1250,19 @@ async def moderate_message(
         timeout_result = await apply_and_verify_timeout(
             message.guild,
             member,
-            AUTO_TIMEOUT_SECOND_ABUSE_MINUTES * 60,
+            AUTO_TIMEOUT_GENERAL_MINUTES * 60,
             reason="Second abusive message detected by Rem",
         )
         expected_until = timeout_result["expected_until"]
         until = timeout_result["actual_until"]
         if not timeout_result["verified"]:
-            logger.error(
+            print(
                 "[AUTO-TIMEOUT UNVERIFIED] Discord did not confirm the "
-                "requested deadline | member_id=%s | expected=%s | actual=%s | "
-                "attempts=%s | verification_error=%r",
-                member.id,
-                expected_until.isoformat(),
-                until.isoformat() if until else None,
-                timeout_result["attempts_used"],
-                timeout_result["verification_error"],
+                f"requested deadline for member_id={member.id}; "
+                f"expected={expected_until.isoformat()} "
+                f"actual={until.isoformat() if until else None} "
+                f"attempts={timeout_result['attempts_used']} "
+                f"verification_error={timeout_result['verification_error']!r}"
             )
             await message.reply(
                 f"{member.mention}, you've already been warned. 🌸 "
@@ -1278,17 +1270,15 @@ async def moderate_message(
             )
             return True
 
-        logger.info(
-            "[AUTO-TIMEOUT SUCCESS] TargetAuthor=%s | Duration=%s minutes | "
-            "AbuseCount=%s | VerifiedUntil=%s | "
-            "Reason=Second abusive message detected by Rem",
-            _member_identity(member),
-            AUTO_TIMEOUT_SECOND_ABUSE_MINUTES,
-            abuse_count,
-            until.isoformat(),
+        print(
+            "[AUTO-TIMEOUT SUCCESS] "
+            f"TargetAuthor={_member_identity(member)} | "
+            f"Duration={AUTO_TIMEOUT_GENERAL_MINUTES} minutes | "
+            f"AbuseCount={abuse_count} | "
+            f"VerifiedUntil={until.isoformat()} | "
+            "Reason=Second abusive message detected by Rem"
         )
 
-        # Reset escalation only after Discord's stored deadline was verified.
         reset_abuse_count(
             guild_id,
             offender_id,
@@ -1297,20 +1287,20 @@ async def moderate_message(
         if action_target is not None:
             response = (
                 f"{member.mention}, you've already been warned. 🌸 "
-                f"I've timed you out for {AUTO_TIMEOUT_SECOND_ABUSE_MINUTES} minutes. "
+                f"I've timed you out for {AUTO_TIMEOUT_GENERAL_MINUTES} minutes. "
                 f"Please keep it respectful toward {action_target.mention}."
             )
         else:
             response = (
                 f"{member.mention}, you've already been warned. 🌸 "
-                f"I've timed you out for {AUTO_TIMEOUT_SECOND_ABUSE_MINUTES} minutes. "
-                "Please keep it respectful."
+                f"I've timed you out for {AUTO_TIMEOUT_GENERAL_MINUTES} minutes. Please keep it respectful."
             )
 
         await message.reply(response)
         return True
+
     except discord.Forbidden:
-        logger.error(
+        print(
             "[AUTO-TIMEOUT ERROR] Discord permission denied."
         )
 
@@ -1320,13 +1310,13 @@ async def moderate_message(
         return True
 
     except discord.HTTPException as e:
-        logger.error(
+        print(
             f"[AUTO-TIMEOUT ERROR] Discord HTTP error: {type(e).__name__}: {e}"
         )
         return False
 
     except Exception as e:
-        logger.error(
+        print(
             f"[AUTO-TIMEOUT ERROR] Unexpected error: {type(e).__name__}: {e}"
         )
         return False

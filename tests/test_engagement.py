@@ -42,6 +42,10 @@ class EngagementHeuristicTests(unittest.TestCase):
     def test_explicit_name_request_bypasses_evaluator(self):
         self.assertTrue(is_direct_rem_request("Rem, can you find a mod?"))
         self.assertTrue(is_direct_rem_request("Hey Rem"))
+        self.assertTrue(is_direct_rem_request("Hey! rem I need to tell you something"))
+        self.assertTrue(is_direct_rem_request("Rem??? I need you to find a mod"))
+        self.assertTrue(is_direct_rem_request("What's up, Rem!?"))
+        self.assertTrue(is_direct_rem_request("Rem give @dac 6 minute timeout"))
 
     def test_rem_mentioned_as_subject_is_not_automatically_direct(self):
         self.assertFalse(is_direct_rem_request("I think Rem would like this."))
@@ -186,6 +190,72 @@ class EngagementGateTests(unittest.IsolatedAsyncioTestCase):
         await gate._tasks[key]
         self.assertEqual(len(evaluator.inputs), 1)
         self.assertEqual(responses, [])
+
+
+    async def test_empty_evaluator_output_does_not_suppress_direct_rem_address(self):
+        evaluator = FakeEvaluator(None)
+        responses = []
+
+        async def load_context(message):
+            return ""
+
+        async def respond(message, context):
+            responses.append((message.id, context))
+
+        gate = ConversationEngagementGate(
+            evaluator=evaluator, context_loader=load_context, response_callback=respond,
+            batch_window_ms=250, min_eval_interval_seconds=0,
+        )
+        message = FakeMessage(1, "What's up, Rem!?")
+        gate.observe(message)
+        self.assertTrue(gate.consider(message))
+        await gate._tasks[(789, 123)]
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], 1)
+
+    async def test_undefined_evaluator_output_uses_deterministic_fallback_for_direct_address(self):
+        evaluator = FakeEvaluator("undefined")
+        responses = []
+
+        async def load_context(message):
+            return ""
+
+        async def respond(message, context):
+            responses.append((message.id, context))
+
+        gate = ConversationEngagementGate(
+            evaluator=evaluator, context_loader=load_context, response_callback=respond,
+            batch_window_ms=250, min_eval_interval_seconds=0,
+        )
+        message = FakeMessage(1, "Hey! Rem I need to tell you something")
+        gate.observe(message)
+        self.assertTrue(gate.consider(message))
+        await gate._tasks[(789, 123)]
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][0], 1)
+
+    async def test_evaluator_response_can_be_recovered_from_assistant_message(self):
+        class MessageOnlyEvaluator:
+            async def arun(self, **kwargs):
+                return SimpleNamespace(content=None, messages=[SimpleNamespace(role="assistant", content="JOIN")])
+
+        responses = []
+
+        async def load_context(message):
+            return "Useful context"
+
+        async def respond(message, context):
+            responses.append(message.id)
+
+        gate = ConversationEngagementGate(
+            evaluator=MessageOnlyEvaluator(), context_loader=load_context, response_callback=respond,
+            batch_window_ms=250, min_eval_interval_seconds=0,
+        )
+        message = FakeMessage(1, "Anyone know a mod for this crash?")
+        gate.observe(message)
+        self.assertTrue(gate.consider(message))
+        await gate._tasks[(789, 123)]
+        self.assertEqual(responses, [1])
 
     async def test_recent_reply_does_not_block_new_topic_candidate(self):
         evaluator = FakeEvaluator("JOIN")

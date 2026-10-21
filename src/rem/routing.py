@@ -7,7 +7,7 @@ def should_accept_dm(*, author_id: int, master_id: int) -> bool:
 
 
 def should_accept_guild_message(*, is_mentioned: bool = False, is_reply_to_rem: bool = False) -> bool:
-    """Agno default requested by the project: process ordinary guild messages too."""
+    """Allow normal guild messages through; engagement decides when Rem joins."""
     return True
 
 
@@ -16,12 +16,12 @@ def should_accept_guild_channel(
     channel_id: int,
     parent_channel_id: int | None,
     allowed_channel_ids: frozenset[int] | set[int],
-    allow_all_channels: bool = False,
+    allow_all_channels: bool = True,
 ) -> bool:
-    """Fail closed unless a guild channel or its parent is explicitly allowed."""
-    if allow_all_channels:
-        return True
-    allowed = {int(value) for value in allowed_channel_ids}
-    return int(channel_id) in allowed or (
-        parent_channel_id is not None and int(parent_channel_id) in allowed
-    )
+    """Do not limit Rem to an allowlist; actual Discord visibility still applies.
+
+    Legacy arguments remain to preserve the old call signature. They no longer
+    block a channel, because the owner requested Rem to work in every accessible
+    channel and thread on the active server.
+    """
+    return True
