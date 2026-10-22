@@ -9,8 +9,6 @@ import httpx
 from agno.run import RunContext
 from agno.tools import Toolkit
 
-from .schemas import ModrinthProjectResult, ModrinthSearchOutput
-
 logger = logging.getLogger(__name__)
 
 _MODRINTH_SEARCH_URL = "https://api.modrinth.com/v2/search"
@@ -72,28 +70,6 @@ def _facets_for(project_type: str, game_version: str, loader: str) -> list[list[
     return facets
 
 
-def _dump_search_output(output: ModrinthSearchOutput) -> dict[str, Any]:
-    """Serialize a Pydantic-validated result into the JSON shape Agno tools expect."""
-    return output.model_dump(mode="json", exclude_none=True)
-
-
-def _search_error(
-    error: str,
-    *,
-    query: str | None = None,
-    project_type: str | None = None,
-) -> dict[str, Any]:
-    return _dump_search_output(
-        ModrinthSearchOutput(
-            ok=False,
-            query=query or None,
-            requested_project_type=project_type or None,
-            results=[],
-            error=error,
-        )
-    )
-
-
 class ModrinthSearchTools(Toolkit):
     """Search the official Modrinth API for Minecraft content projects."""
 
@@ -108,7 +84,12 @@ class ModrinthSearchTools(Toolkit):
             "Honor exact Minecraft game_version constraints. Use loader only for mods or "
             "modpacks, and only when the user specifies one. The API defaults to 10 results; "
             "never claim compatibility unless the returned version/loader metadata supports it. "
-            "Only recommend projects and URLs returned by this tool."
+            "Only recommend projects returned by this tool. For each project you recommend in "
+            "your user-facing response, include a clickable Markdown link using that exact result's "
+            "title and url fields: [Project title](https://modrinth.com/...). Do not omit the url, "
+            "do not invent or reconstruct a URL from the project name, and do not output a raw tool "
+            "dump. The Discord application will only clean malformed Markdown residue; it will not "
+            "append results, add links, or compose the recommendation for you."
         )
         super().__init__(
             name="modrinth_search",
@@ -149,43 +130,42 @@ class ModrinthSearchTools(Toolkit):
         """
         query = " ".join((query or "").split())
         if len(query) < 2:
-            return _search_error(
-                "Provide a project name or feature with at least 2 characters.",
-                query=query or None,
-            )
+            return {
+                "ok": False,
+                "error": "Provide a project name or feature with at least 2 characters.",
+                "results": [],
+            }
 
         normalized_type = _normalize_project_type(project_type)
         if normalized_type is None:
-            return _search_error(
-                "Unsupported project_type. Use mod, resourcepack, datapack, shader, "
-                "modpack, or all. Plugins and servers are not supported by this tool.",
-                query=query,
-                project_type=project_type,
-            )
+            return {
+                "ok": False,
+                "error": (
+                    "Unsupported project_type. Use mod, resourcepack, datapack, shader, "
+                    "modpack, or all. Plugins and servers are not supported by this tool."
+                ),
+                "results": [],
+            }
 
         try:
             limit = max(1, min(int(max_results), 10))
         except (TypeError, ValueError, OverflowError):
-            return _search_error(
-                "max_results must be an integer from 1 to 10.",
-                query=query,
-                project_type=normalized_type,
-            )
+            return {"ok": False, "error": "max_results must be an integer from 1 to 10.", "results": []}
 
         version_filter = " ".join((game_version or "").split())
         normalized_loader = "".join(char for char in (loader or "").strip().casefold() if char.isalnum() or char == "_")
         if normalized_loader and normalized_loader not in _ALLOWED_LOADERS:
-            return _search_error(
-                "Unsupported loader. Use Fabric, Forge, NeoForge, Quilt, or Quilted Fabric.",
-                query=query,
-                project_type=normalized_type,
-            )
+            return {
+                "ok": False,
+                "error": "Unsupported loader. Use Fabric, Forge, NeoForge, Quilt, or Quilted Fabric.",
+                "results": [],
+            }
         if normalized_loader and normalized_type not in {"mod", "modpack", "all"}:
-            return _search_error(
-                "Loader filtering applies to mods and modpacks, not resource packs, data packs, or shaders.",
-                query=query,
-                project_type=normalized_type,
-            )
+            return {
+                "ok": False,
+                "error": "Loader filtering applies to mods and modpacks, not resource packs, data packs, or shaders.",
+                "results": [],
+            }
 
         facets = _facets_for(normalized_type, version_filter, normalized_loader)
         # A broad search may include mixed-type results despite facets being OR-ed.
@@ -205,11 +185,7 @@ class ModrinthSearchTools(Toolkit):
 
             if not isinstance(payload, dict) or not isinstance(payload.get("hits", []), list):
                 logger.warning("Modrinth search returned an unexpected response shape | query=%r", query)
-                return _search_error(
-                    "Modrinth returned an unexpected response format.",
-                    query=query,
-                    project_type=normalized_type,
-                )
+                return {"ok": False, "error": "Modrinth returned an unexpected response format.", "results": []}
 
             results: list[dict[str, Any]] = []
             for hit in payload.get("hits", []):
@@ -244,9 +220,7 @@ class ModrinthSearchTools(Toolkit):
                     # Some search responses expose datapacks only through all_project_types.
                     link_type = "datapack" if "datapack" in all_types else normalized_type
 
-                # Validate every project row before exposing it to the language model.
-                # This rejects malformed/unsupported URLs at the tool boundary.
-                results.append(ModrinthProjectResult.model_validate({
+                results.append({
                     "title": hit.get("title") or slug,
                     "summary": hit.get("description") or "",
                     "project_type": link_type,
@@ -261,30 +235,28 @@ class ModrinthSearchTools(Toolkit):
                     "environment": hit.get("environment", []),
                     "categories": hit.get("categories") or hit.get("display_categories", []),
                     "game_versions": hit.get("versions", []),
-                }))
+                })
                 if len(results) >= limit:
                     break
 
-            return _dump_search_output(
-                ModrinthSearchOutput(
-                    ok=True,
-                    query=query,
-                    requested_project_type=normalized_type,
-                    results=results,
-                    source="Modrinth public API",
-                )
-            )
+            return {
+                "ok": True,
+                "query": query,
+                "requested_project_type": normalized_type,
+                "results": results,
+                "source": "Modrinth public API",
+            }
         except (httpx.HTTPError, ValueError, TypeError) as exc:
             logger.exception("Modrinth search failed | query=%r | project_type=%s", query, normalized_type)
-            return _search_error(
-                f"Modrinth search failed: {type(exc).__name__}: {exc}",
-                query=query,
-                project_type=normalized_type,
-            )
+            return {
+                "ok": False,
+                "error": f"Modrinth search failed: {type(exc).__name__}: {exc}",
+                "results": [],
+            }
         except Exception as exc:
             logger.exception("Unexpected Modrinth search failure | query=%r | project_type=%s", query, normalized_type)
-            return _search_error(
-                f"Modrinth search failed: {type(exc).__name__}: {exc}",
-                query=query,
-                project_type=normalized_type,
-            )
+            return {
+                "ok": False,
+                "error": f"Modrinth search failed: {type(exc).__name__}: {exc}",
+                "results": [],
+            }
