@@ -74,3 +74,15 @@ class ModrinthSearchOutput(BaseModel):
     results: list[ModrinthProjectResult] = Field(default_factory=list)
     source: str | None = None
     error: str | None = None
+
+
+class ModrinthSearchIntent(BaseModel):
+    """Validated search intent parsed from an explicit Minecraft project request."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
+
+    query: str = Field(min_length=2, max_length=120)
+    project_type: Literal["mod", "modpack", "resourcepack", "datapack", "shader"] = "mod"
+    game_version: str | None = Field(default=None, pattern=r"^\d+\.\d+(?:\.\d+)?$")
+    loader: Literal["fabric", "forge", "neoforge", "quilt", "quilted_fabric"] | None = None
+    max_results: int = Field(default=6, ge=1, le=8)

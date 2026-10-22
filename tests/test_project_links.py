@@ -75,6 +75,44 @@ class ProjectLinkNormalizationTests(unittest.TestCase):
             f"[JourneyMap]({JOURNEYMAP})",
         )
 
+    def test_collects_python_repr_of_modrinth_tool_result(self):
+        # Agno may persist a tool payload as Python repr instead of JSON. The
+        # project-link parser must recover real URLs from that result shape too.
+        result = {
+            "ok": True,
+            "query": "horror",
+            "source": "Modrinth public API",
+            "results": [{
+                "title": "The Mimicer (horror)",
+                "slug": "the-mimicer-horror",
+                "url": "https://modrinth.com/mod/the-mimicer-horror",
+                "project_type": "mod",
+            }],
+        }
+        tool = SimpleNamespace(name="search_modrinth_projects", result=repr(result))
+        output = SimpleNamespace(tools=[tool], events=[], messages=[])
+        links = collect_verified_project_links(output)
+        self.assertEqual(links["the mimicer (horror)"], "https://modrinth.com/mod/the-mimicer-horror")
+
+    def test_links_plain_verified_titles_and_appends_omitted_search_results(self):
+        mimicer = "https://modrinth.com/mod/the-mimicer-horror"
+        obsessed = "https://modrinth.com/mod/obsessed"
+        verified = {
+            "the mimicer (horror)": mimicer,
+            "the-mimicer-horror": mimicer,
+            "the obsessed": obsessed,
+            "obsessed": obsessed,
+        }
+        source = "Here are two horror mods: **The Mimicer (horror)** is frightening."
+        normalized = normalize_project_markdown_links(source, verified)
+        self.assertIn("**[The Mimicer (horror)](https://modrinth.com/mod/the-mimicer-horror)**", normalized)
+        self.assertIn("[The Obsessed](https://modrinth.com/mod/obsessed)", normalized)
+        self.assertIn("Verified project links returned by the search tool:", normalized)
+
+    def test_empty_catalog_does_not_strip_an_existing_canonical_link(self):
+        source = "Try [Sodium](https://modrinth.com/mod/sodium) for performance."
+        self.assertEqual(normalize_project_markdown_links(source, verified_links={}), source)
+
     def test_collects_urls_from_tool_messages_when_aggregate_tools_are_empty(self):
         result = {
             "ok": True,

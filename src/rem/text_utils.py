@@ -1,6 +1,7 @@
 """Pure text and project-link helpers, importable without Discord/Agno installed."""
 from __future__ import annotations
 
+import ast
 import json
 import re
 from urllib.parse import urlsplit, urlunsplit
@@ -96,17 +97,28 @@ def _link_key(value: Any) -> str:
     text = str(value or "").strip()
     text = re.sub(r"[`*_~]", "", text)
     text = re.sub(r"\s+", " ", text)
-    return text.casefold().strip(" [](){}.,;:!?")
+    # Preserve balanced parentheses within real project titles, e.g.
+    # "The Mimicer (horror)"; only remove common outer Markdown brackets.
+    text = text.strip()
+    text = text.strip("[]{}.,;:!?")
+    return text.casefold()
 
 
 def _iter_mapping_nodes(value: Any):
     """Yield dictionaries nested inside tool results, decoding JSON strings when possible."""
     if isinstance(value, str):
+        # Agno/tool traces may retain a dict as Python repr (single quotes,
+        # True/False/None) instead of JSON. literal_eval parses data literals
+        # safely; never use eval for model/tool content.
         try:
             decoded = json.loads(value)
         except (json.JSONDecodeError, TypeError):
-            return
-        yield from _iter_mapping_nodes(decoded)
+            try:
+                decoded = ast.literal_eval(value)
+            except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+                return
+        if isinstance(decoded, (dict, list, tuple)):
+            yield from _iter_mapping_nodes(decoded)
         return
     if isinstance(value, dict):
         yield value
@@ -245,6 +257,84 @@ _MODRINTH_PATH_RE = re.compile(
 )
 
 
+_EXISTING_LINK_OR_URL_RE = re.compile(
+    r"\[[^\]\n]+\]\(https?://[^)\s]+\)|https?://[^\s<>]+",
+    re.IGNORECASE,
+)
+
+
+def _display_label_for_url(catalog: dict[str, str], url: str) -> str:
+    """Choose a readable title alias for a verified canonical URL."""
+    aliases = [
+        key for key, candidate in catalog.items()
+        if candidate == url and not key.startswith("http")
+        and "/" not in key and len(key) >= 4
+    ]
+    if aliases:
+        # Multi-word names are more likely to be the API title than a slug.
+        label = max(aliases, key=lambda item: (" " in item, len(item)))
+        return label.title()
+    slug = _project_slug(url)
+    return slug.replace("-", " ").replace("_", " ").title() or url
+
+
+def _link_verified_names(content: str, catalog: dict[str, str]) -> str:
+    """Turn known result titles mentioned as plain text into clickable links.
+
+    Existing Markdown links and bare URLs are temporarily protected so labels
+    or URLs are never nested or rewritten. Only aliases from real tool results
+    are eligible for auto-linking.
+    """
+    aliases = [
+        (alias, url) for alias, url in catalog.items()
+        if len(alias) >= 4 and "/" not in alias and not alias.startswith("http")
+        and _clean_url_candidate(url)
+    ]
+    aliases.sort(key=lambda item: len(item[0]), reverse=True)
+    if not aliases:
+        return content
+
+    protected: list[str] = []
+    def stash(match: re.Match[str]) -> str:
+        protected.append(match.group(0))
+        return f"\x00REM_LINK_{len(protected)-1}\x00"
+
+    working = _EXISTING_LINK_OR_URL_RE.sub(stash, content)
+    for alias, url in aliases:
+        canonical = _clean_url_candidate(url)
+        if not canonical:
+            continue
+        pattern = re.compile(rf"(?<![\w/])({re.escape(alias)})(?![\w])", re.IGNORECASE)
+        working = pattern.sub(lambda match, target=canonical: f"[{match.group(1)}]({target})", working)
+    for index, original in enumerate(protected):
+        working = working.replace(f"\x00REM_LINK_{index}\x00", original)
+    return working
+
+
+def _append_missing_verified_links(content: str, catalog: dict[str, str]) -> str:
+    """Append actual tool results omitted by the model, without inventing projects."""
+    unique_urls: list[str] = []
+    for url in catalog.values():
+        canonical = _clean_url_candidate(url)
+        if canonical and canonical not in unique_urls:
+            unique_urls.append(canonical)
+    if not unique_urls:
+        return content
+
+    present_urls = {
+        canonical for raw in re.findall(r"https?://[^\s)<>]+", content, flags=re.IGNORECASE)
+        if (canonical := _clean_url_candidate(raw))
+    }
+    missing = [url for url in unique_urls if url not in present_urls]
+    if not missing:
+        return content
+
+    lines = ["Verified project links returned by the search tool:"]
+    for url in missing:
+        lines.append(f"• [{_display_label_for_url(catalog, url)}]({url})")
+    return f"{content.rstrip()}\n\n" + "\n".join(lines)
+
+
 def normalize_project_markdown_links(content: str, verified_links: dict[str, str] | None = None) -> str:
     """Repair malformed project links and prefer exact URLs returned by search tools.
 
@@ -254,11 +344,20 @@ def normalize_project_markdown_links(content: str, verified_links: dict[str, str
     """
     if not isinstance(content, str) or not content:
         return content or ""
+    # Only synthesize an extra verified-results section when the model omitted
+    # project URLs completely. If it tried to format links, repair those links
+    # in place and avoid adding a duplicate catalog beneath them.
+    had_project_link_attempt = bool(re.search(
+        r"(?:\]\(https?://(?:www\.)?(?:modrinth\.com|curseforge\.com)/|"
+        r"https?://(?:www\.)?(?:modrinth\.com|curseforge\.com)/)",
+        content,
+        flags=re.IGNORECASE,
+    ))
     catalog = {key: value for key, value in (verified_links or {}).items() if _clean_url_candidate(value)}
     # A provided catalog means the caller has the current run's tool results, so
     # enforce that links resolve to those results. None means a legacy caller with
     # no catalog: repair formatting only and preserve valid URLs for compatibility.
-    strict = verified_links is not None
+    strict = bool(catalog)
 
     def resolve(label: str, href: str) -> str | None:
         for value in (label, href, _project_slug(href), _project_slug(label)):
@@ -351,6 +450,9 @@ def normalize_project_markdown_links(content: str, verified_links: dict[str, str
         return verified + clean_tail
 
     normalized = _PROJECT_URL_IN_TEXT_RE.sub(clean_plain, normalized)
+    if catalog and not had_project_link_attempt:
+        normalized = _link_verified_names(normalized, catalog)
+        normalized = _append_missing_verified_links(normalized, catalog)
     return normalized
 
 

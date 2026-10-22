@@ -9,7 +9,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import discord
-from agno.agent import Agent
 from agno.integrations.discord import DiscordClient
 from agno.media import Image
 from dotenv import load_dotenv
@@ -29,12 +28,15 @@ from .moderation import moderate_message
 from .memory_service import RemMemoryService
 from .session_locks import SessionLockPool
 from .settings import Settings
-from .text_utils import collect_verified_project_links, looks_like_raw_tool_call_payload, normalize_project_markdown_links
+from .text_utils import collect_verified_project_links, looks_like_raw_tool_call_payload, normalize_project_markdown_links, split_discord_message
+from .modrinth_tools import ModrinthSearchTools
+from .project_search import format_modrinth_search_reply, parse_modrinth_search_intent
 from .observability import (
     configure_observability,
     install_asyncio_exception_handler,
     shutdown_observability,
     set_span_input_output,
+    set_span_error,
     trace_span,
 )
 
@@ -57,17 +59,21 @@ class RemAgnoDiscordClient(DiscordClient):
     def __init__(
         self,
         *,
-        agent: Agent,
-        vision_agent: Agent,
+        agent: Any,
+        vision_agent: Any,
         client: discord.Client,
         settings: Settings,
         moderation_client: Any,
         memory_service: RemMemoryService | None = None,
-        engagement_evaluator: Agent | None = None,
+        engagement_evaluator: Any | None = None,
     ) -> None:
         self.settings = settings
         self.moderation_client = moderation_client
         self.vision_agent = vision_agent
+        # Explicit mod-catalog requests use the real Modrinth API directly and
+        # produce the user-facing links from validated API records. This prevents
+        # the LLM from omitting links or inventing projects when it skips tool use.
+        self.modrinth_search_tool = ModrinthSearchTools(timeout=12)
         self.memory_service = memory_service
         self._session_locks = SessionLockPool()
         self.engagement_gate = ConversationEngagementGate(
@@ -218,6 +224,26 @@ class RemAgnoDiscordClient(DiscordClient):
                     )
                 return
 
+        # Deterministic project search is handled immediately after explicit
+        # moderation commands and before image/context collection, the engagement
+        # evaluator, memory work, or the conversational agent. Do not delegate a
+        # clear catalog query to the LLM: it may omit links even after calling the
+        # search tool. The reply is formatted from validated Modrinth API records.
+        project_intent = parse_modrinth_search_intent(message.content or "")
+        if project_intent is not None and isinstance(
+            message.channel, (discord.Thread, discord.DMChannel, discord.TextChannel)
+        ):
+            self.engagement_gate.cancel_pending_for(message)
+            logger.info(
+                "MODRINTH DIRECT SEARCH | message_id=%s | query=%s | project_type=%s | game_version=%s | conversational_agent_skipped=true",
+                message.id,
+                project_intent.query,
+                project_intent.project_type,
+                project_intent.game_version or "unspecified",
+            )
+            await self._respond_with_modrinth_search(message.channel, message, project_intent)
+            return
+
         message_text = (message.content or "").strip()
         image_inputs, ignored_media = await self._collect_images(message)
         if not message_text and image_inputs:
@@ -271,6 +297,7 @@ class RemAgnoDiscordClient(DiscordClient):
         if direct_request:
             if not _auto_approved:
                 self.engagement_gate.cancel_pending_for(message)
+
             if _context_override is not None:
                 context = _context_override
             else:
@@ -508,9 +535,19 @@ class RemAgnoDiscordClient(DiscordClient):
                     response_content = getattr(agent_response, "content", None)
                     if isinstance(response_content, str):
                         verified_project_links = collect_verified_project_links(agent_response)
+                        # If Agno exposes no structured tool-result records, use
+                        # format-only mode rather than treating an empty catalog as
+                        # proof that every canonical URL in the model response is bad.
+                        # When records are present, the normalizer also hyperlinks
+                        # exact verified project titles the model left as plain text,
+                        # and appends any real search results it omitted entirely.
                         normalized_content = normalize_project_markdown_links(
                             response_content,
-                            verified_links=verified_project_links,
+                            verified_links=verified_project_links or None,
+                        )
+                        request_span.set_attribute(
+                            "rem.project_search.verified_alias_count",
+                            len(verified_project_links),
                         )
                         if normalized_content != response_content:
                             logger.warning(
@@ -544,6 +581,77 @@ class RemAgnoDiscordClient(DiscordClient):
                     except discord.HTTPException:
                         logger.exception("Could not send processing error message | message_id=%s", message.id)
 
+    async def _respond_with_modrinth_search(self, thread: Any, message: discord.Message, intent: Any) -> None:
+        """Search Modrinth and send links built only from validated tool results."""
+        with trace_span(
+            "rem.modrinth.direct_search",
+            {
+                "discord.message.id": str(message.id),
+                "discord.guild.id": str(message.guild.id) if message.guild else "dm",
+                "discord.channel.id": str(getattr(message.channel, "id", "")),
+                "rem.component": "modrinth_direct_search",
+                "rem.modrinth.project_type": intent.project_type,
+                "rem.modrinth.game_version": intent.game_version or "",
+            },
+        ) as search_span:
+            set_span_input_output(
+                search_span,
+                input_value={
+                    "query": intent.query,
+                    "project_type": intent.project_type,
+                    "game_version": intent.game_version,
+                    "loader": intent.loader,
+                    "max_results": intent.max_results,
+                },
+            )
+            try:
+                raw_result = await self.modrinth_search_tool.search_modrinth_projects(
+                    query=intent.query,
+                    project_type=intent.project_type,
+                    game_version=intent.game_version or "",
+                    loader=intent.loader or "",
+                    max_results=intent.max_results,
+                )
+                reply = format_modrinth_search_reply(raw_result, intent)
+                result_rows = raw_result.get("results", []) if isinstance(raw_result, dict) else []
+                search_span.set_attribute("rem.modrinth.search.ok", bool(raw_result.get("ok")) if isinstance(raw_result, dict) else False)
+                search_span.set_attribute("rem.modrinth.search.result_count", len(result_rows) if isinstance(result_rows, list) else 0)
+                set_span_input_output(
+                    search_span,
+                    output_value={
+                        "ok": bool(raw_result.get("ok")) if isinstance(raw_result, dict) else False,
+                        "result_count": len(result_rows) if isinstance(result_rows, list) else 0,
+                        "validated_projects": [
+                            {
+                                "title": row.get("title"),
+                                "url": row.get("url"),
+                                "game_versions": row.get("game_versions", []),
+                            }
+                            for row in result_rows[:8]
+                            if isinstance(row, dict)
+                        ] if isinstance(result_rows, list) else [],
+                        "reply_chars": len(reply),
+                        "source": raw_result.get("source") if isinstance(raw_result, dict) else None,
+                        "reply_contains_modrinth_link": "https://modrinth.com/" in reply,
+                    },
+                )
+            except Exception as exc:
+                set_span_error(search_span, exc)
+                set_span_input_output(
+                    search_span,
+                    output_value={
+                        "ok": False,
+                        "error_type": f"{type(exc).__module__}.{type(exc).__qualname__}",
+                        "error": str(exc),
+                    },
+                )
+                logger.exception("Direct Modrinth search failed | message_id=%s | query=%r", message.id, intent.query)
+                reply = (
+                    f"I couldn't reach or validate Modrinth's current results for **{intent.query}**. "
+                    "I won't invent project names or links. Please try again shortly. 🌸"
+                )
+        await self._send_discord_messages(thread, reply)
+
     async def _send_discord_messages(self, thread: Any, message: str, italics: bool = False) -> None:
         """Keep Agno response handling while blocking raw function-call JSON from chat."""
         content = message or ""
@@ -554,7 +662,8 @@ class RemAgnoDiscordClient(DiscordClient):
             logger.error("Blocked raw tool-call payload from Discord output; tool execution/result flow was not represented as a user-facing answer.")
             content = "I couldn't complete that request properly, so I can't give you verified results yet. Please try again in a moment. 🌸"
             italics = False
-        chunks = [content[i:i + 1500] for i in range(0, len(content), 1500)] if len(content) >= 1500 else [content]
+        # Split at paragraph/line boundaries before hard cuts; fixed-width slicing can split a Markdown URL.
+        chunks = split_discord_message(content, limit=1800) or [content[:1800]]
         for index, chunk in enumerate(chunks, 1):
             if len(chunks) > 1:
                 chunk = f"[{index}/{len(chunks)}] {chunk}"
